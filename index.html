@@ -86,7 +86,7 @@
     #app.arview #panel { left:0; right:0; width:auto; height:auto; }
     #app.arview #hud, #app.arview #topstack { right:10px; }
     #app.xr:not(.arview) #floorinfo { bottom:10px; left:10px; }
-  }
+    }
 </style>
 </head>
 <body>
@@ -98,7 +98,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos flotando: acércate y revienta cada uno con la mano (la profundidad detecta tu mano y dibuja una aguja), con un empujón del móvil o pulsándolo. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos pequeños que se mueven: acércate a menos de 0,5 m, apunta con el punto de mira (centro de la pantalla) y toca el globo, o toca en cualquier sitio con la mira sobre él. Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -389,64 +389,18 @@ class Odometer {
   }
 }
 
-// Distancia de un punto (px, py) al segmento a–b (todo en píxeles)
-function distToSegment(px, py, a, b) {
-  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
-  const t = l2 < 1e-12 ? 0 : Math.max(0, Math.min(1, ((px - a.x) * dx + (py - a.y) * dy) / l2));
-  return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy));
-}
-
-// ¿Está (px, py) dentro del polígono `poly` (lista de {x, y})? Algoritmo del rayo
-function pointInPolygon(px, py, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const a = poly[i], b = poly[j];
-    if ((a.y > py) !== (b.y > py) && px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x) inside = !inside;
-  }
-  return inside;
-}
-
-// Globos: color de cada uno (r,g,b), altura de flotación sobre el suelo y balanceo suave
+// Globos: color de cada uno (r,g,b) y radio (m). Son pequeños y se desplazan alrededor de su punto.
 const BALLOON_RGB = ['255,90,95', '255,180,84', '61,220,151', '74,168,255', '199,125,255'];
-const BALLOON_H = 1.1;
-const balloonY = (floorY, i, nowMs) => floorY + BALLOON_H + 0.07 * Math.sin(nowMs / 650 + i * 1.7);
-
-/*
- * "Mano" a partir de la profundidad: muestras {nx, ny, d, x, y, z} de lo que hay MUY cerca de la cámara
- * (y por encima del suelo). Si forman un objeto de tamaño de mano (no una pared ni una mesa entera) se
- * devuelve su punta = lo más alto en la pantalla (dedos hacia arriba), media de las muestras de esa franja.
- */
-function detectHand(samples, opts = {}) {
-  const minCount = opts.minCount ?? 6, maxExtent = opts.maxExtent ?? 0.7;
-  if (!samples || samples.length < minCount) return null;
-  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity, top = Infinity;
-  for (const q of samples) {
-    x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y);
-    z0 = Math.min(z0, q.z); z1 = Math.max(z1, q.z); top = Math.min(top, q.ny);
-  }
-  const extent = Math.hypot(x1 - x0, y1 - y0, z1 - z0);
-  if (extent > maxExtent) return null;
-  const tipS = samples.filter(q => q.ny <= top + 0.06), n = tipS.length, m = k => tipS.reduce((a, q) => a + q[k], 0) / n;
-  return { tip: { nx: m('nx'), ny: m('ny'), d: m('d'), x: m('x'), y: m('y'), z: m('z') }, count: samples.length, extent };
+const BALLOON_R = 0.06;
+const BALLOON_SWAY = 0.25;
+// Posición 3D del globo i (t en ms): flota a ~1,1 m del suelo describiendo una trayectoria suave (±25 cm en x/z, ±20 cm en altura)
+function balloonPos(w, floorY, i, t) {
+  return { x: w.x + BALLOON_SWAY * Math.sin(t / 1100 + i * 2.1), z: w.z + BALLOON_SWAY * Math.cos(t / 1500 + i * 1.3), y: floorY + 1.1 + 0.2 * Math.sin(t / 900 + i * 1.7) };
 }
-
-/*
- * Gesto con el móvil: "empujón" hacia un objetivo. Se alimenta con la distancia móvil→objetivo en cada
- * fotograma; salta cuando el móvil está a <= reach m y en los últimos `win` ms se ha acercado >= approach m.
- */
-class GrabDetector {
-  constructor(opts = {}) { this.reach = opts.reach ?? 0.35; this.approach = opts.approach ?? 0.25; this.win = opts.win ?? 400; this.h = []; }
-  reset() { this.h = []; }
-  update(d, now) {
-    this.h.push({ d, t: now });
-    while (this.h.length && now - this.h[0].t > this.win) this.h.shift();
-    if (d > this.reach) return false;
-    let far = 0;
-    for (const q of this.h) far = Math.max(far, q.d);
-    if (far - d < this.approach) return false;
-    this.h = [];                                   // el gesto se consume
-    return true;
-  }
+// ¿Está (px, py) dentro de la elipse e = { x, y, rx, ry } agrandada `slack` píxeles?
+function pointInEllipse(px, py, e, slack = 0) {
+  const a = e.rx + slack, b = e.ry + slack;
+  return ((px - e.x) / a) ** 2 + ((py - e.y) / b) ** 2 <= 1;
 }
 
 /*
@@ -482,8 +436,8 @@ class Course {
     return !!t && Math.hypot(t.r - cur.r, t.f - cur.f) <= this.radius;
   }
   // Captura el punto actual si se está a su alcance (el jugador lo pulsa); devuelve true si lo capturó
-  capture(cur, now, force = false) {
-    if (this.done || (!force && !this.inRange(cur))) return false;     // force: la mano ha tocado el globo, aunque esté algo lejos
+  capture(cur, now) {
+    if (!this.inRange(cur)) return false;
     this.idx++;
     if (this.idx >= this.pts.length) { this.done = true; this.tEnd = now; }
     return true;
@@ -522,8 +476,7 @@ class Course {
   let wasInRange = false;            // para vibrar una vez al entrar en el radio del punto
   let flash = null;                  // onda verde al capturar un punto: { w, t, R }
   let pops = [];                     // globos explotando: { x, y, z, rgb, t, frags }
-  const hand = { last: null };       // última mano detectada con la profundidad: { tip, pts, t }
-  const grab = new GrabDetector();   // gesto de "empujón" con el móvil hacia el globo
+  let misses = [];                   // toques que han fallado: { x, y, t }
   let camY = null;                   // altura actual del móvil (para el suelo estimado)
   const floorY = y => floor.y != null ? floor.y : (y ?? camY ?? 1.3) - 1.3;
 
@@ -654,8 +607,7 @@ class Course {
     if (xr.hitSrc) sampleFloor(frame, pos);
     if (scan.state === 'scanning') scanStep(frame, pose, performance.now());
     camY = pos.y;
-    handStep(frame, pose, performance.now());
-    tick({ x: pos.x, y: pos.y, z: pos.z, fwd: v.f, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
+    tick({ x: pos.x, z: pos.z, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
     drawAR(pose);
   }
 
@@ -691,7 +643,6 @@ class Course {
       const inR = course.inRange(odo.s.cur);
       if (inR && !wasInRange && navigator.vibrate) navigator.vibrate(25);   // aviso táctil al entrar en el radio
       wasInRange = inR;
-      if (mode === 'xr' && p && p.y != null && !course.done) autoCapture(p, now);
     }
     updateGame(now);
     const tr = $('track'), msg = banner || (now < noteUntil ? noteMsg : '');
@@ -814,34 +765,28 @@ class Course {
     g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
-      + (inR ? '¡Explótalo! Acerca la mano al globo (o púlsalo)' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+      + (inR ? '¡Apunta con la mira y toca el globo!' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
   }
 
-  // ---------- Capturar un punto: a menos de 0,5 m y pulsando una parte del punto ----------
-  function hitAt(h, x, y) {
-    if (h.marker && Math.hypot(x - h.marker.x, y - h.marker.y) <= h.marker.r) return true;     // marcador con el número
-    if (h.pole && distToSegment(x, y, h.pole[0], h.pole[1]) <= 26) return true;                 // poste
-    return !!h.ring && pointInPolygon(x, y, h.ring);                                             // anillo del suelo
-  }
-
-  // Captura el punto actual: el globo explota. force = la mano (aguja) lo ha tocado, no hace falta estar a < 0,5 m
-  function capturePoint(now, force) {
+  // ---------- Capturar un punto: a menos de 0,5 m y acertando con el toque sobre el globo ----------
+  // Captura el punto actual: el globo explota
+  function capturePoint(now) {
     const t = course.target, idx = course.idx, w = odo.mapToWorld(t.r, t.f);
-    if (!course.capture(odo.s.cur, now, force)) return false;
-    const by = balloonY(floorY(), idx, now);
+    if (!course.capture(odo.s.cur, now)) return false;
+    const bp = balloonPos(w, floorY(), idx, now);
     flash = { w, t: now, R: course.radius };
     const frags = [];
     for (let k = 0; k < 16; k++) {                    // trozos de globo que salen despedidos y caen
       const a = Math.random() * 2 * Math.PI, e = (Math.random() - 0.3) * 1.2, v = 0.5 + Math.random() * 0.7;
       frags.push({ vx: Math.cos(a) * Math.cos(e) * v, vy: Math.sin(e) * v + 0.3, vz: Math.sin(a) * Math.cos(e) * v, s: 0.008 + Math.random() * 0.012 });
     }
-    pops.push({ x: w.x, y: by, z: w.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
+    pops.push({ x: bp.x, y: bp.y, z: bp.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
     if (navigator.vibrate) navigator.vibrate(course.done ? [60, 40, 60] : 60);
     if (!course.done) showNote('¡Pop! Globo ' + (idx + 1) + ' ✓');
     return true;
   }
 
-  // Pulsar el globo en pantalla (alternativa a la mano): hay que estar a menos de `radius` m
+  // Toque que ha dado en el globo (o en el círculo del mapa): hay que estar a menos de `radius` m del punto
   function tryCapture() {
     if (!course || course.done || !odo.started) return;
     const t = course.target, cur = odo.s.cur;
@@ -850,42 +795,16 @@ class Course {
       showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para explotarlo');
       return;
     }
-    capturePoint(performance.now(), false);
+    capturePoint(performance.now());
   }
 
-  // Mano con aguja o gesto del móvil que revientan el globo actual (solo AR)
-  function autoCapture(p, now) {
-    if (grab.owner !== course || grab.idx !== course.idx) { grab.reset(); grab.owner = course; grab.idx = course.idx; }
-    const t = course.target, w = odo.mapToWorld(t.r, t.f), by = balloonY(floorY(p.y), course.idx, now);
-    const d = Math.hypot(p.x - w.x, p.y - by, p.z - w.z);
-    const h = hand.last;
-    // 1) la punta de la aguja (en la mano detectada) toca el globo
-    if (h && now - h.t < 200 && d <= 1.2 && Math.hypot(h.tip.x - w.x, h.tip.y - by, h.tip.z - w.z) <= 0.22) { capturePoint(now, true); return; }
-    // 2) empujón del móvil hacia el globo, mirándolo, estando muy cerca
-    let face = 1;
-    if (p.fwd && d > 1e-6) face = (p.fwd.x * (w.x - p.x) + p.fwd.y * (by - p.y) + p.fwd.z * (w.z - p.z)) / d;
-    if (grab.update(d, now) && face >= 0.6) capturePoint(now, false);
-  }
-
-  // Busca la mano con la profundidad: lo que hay a 0,25–0,9 m de la cámara, por encima del suelo y del tamaño de una mano
-  function handStep(frame, pose, now) {
-    if (!xr || !xr.depthOk || !course || course.done || !odo.started) return;
-    const pos = pose.transform.position, t = course.target, w = odo.mapToWorld(t.r, t.f), fy = floorY(pos.y);
-    if (Math.hypot(pos.x - w.x, pos.y - balloonY(fy, course.idx, now), pos.z - w.z) > 1.6) return;   // solo cerca del globo
-    const view = pose.views[0];
-    let di = null;
-    try { di = frame.getDepthInformation(view); } catch (e) { di = null; }
-    if (!di) return;
-    const P = view.projectionMatrix, M = view.transform.matrix, S = [];
-    for (let ny = 0.06; ny < 0.97; ny += 0.05) for (let nx = 0.06; nx < 0.95; nx += 0.04) {
-      const d = di.getDepthInMeters(nx, ny);
-      if (!(d > 0.25 && d < 0.9)) continue;
-      const q = depthToWorld(P, M, nx, ny, d);
-      if (q.y - fy < 0.15) continue;                                  // el suelo no es una mano
-      S.push({ nx, ny, d, x: q.x, y: q.y, z: q.z });
-    }
-    const res = detectHand(S);
-    if (res) hand.last = { tip: res.tip, pts: S, t: now };
+  // Disparo en la vista de cámara: acierta si el toque cae sobre el globo, o si se toca en cualquier sitio con la mira (centro) sobre él
+  function shootAR(tx, ty) {
+    const ball = hitAR && hitAR.ball, W = arC.clientWidth, H = arC.clientHeight;
+    if (ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4))) { tryCapture(); return; }
+    misses.push({ x: tx, y: ty, t: performance.now() });
+    if (navigator.vibrate) navigator.vibrate(15);
+    showNote('¡Fallaste! Pon la mira sobre el globo y toca', 1200);
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -1013,7 +932,7 @@ class Course {
     for (const t of tg) {
       const actual = !course.done && t.i === course.idx, ready = actual && listo;
       const col = ready ? '61,220,151' : actual ? '255,180,84' : '255,255,255', al = actual ? 1 : 0.45;
-      const R = course.radius, hit = actual ? { marker: null, pole: null, ring: null } : null;
+      const R = course.radius, hit = actual ? { ball: null } : null;
       if (hit) hitAR = hit;                                            // zonas pulsables del punto actual
 
       // Anillo en el suelo (relleno translúcido si entero está delante de la cámara)
@@ -1021,7 +940,6 @@ class Course {
       if (proj.every(Boolean)) {
         actx.fillStyle = 'rgba(' + col + ',' + (ready ? 0.32 : actual ? 0.22 : 0.08) + ')'; actx.beginPath();
         proj.forEach((p, k) => k ? actx.lineTo(p.x, p.y) : actx.moveTo(p.x, p.y)); actx.closePath(); actx.fill();
-        if (hit) hit.ring = proj;
       }
       strokeView(ring, 'rgba(' + col + ',' + al + ')', actual ? 4 : 2);
       if (actual) {                                                     // onda que se expande (más rápida al estar a su alcance)
@@ -1029,23 +947,20 @@ class Course {
         strokeView(ringAt(t.w, R * (1 + k * 0.8)), 'rgba(' + col + ',' + (1 - k) * 0.8 + ')', 3);
       }
 
-      // Globo flotando sobre el anillo, atado al suelo con un hilo
-      const bY = balloonY(fy, t.i, now), rgb = BALLOON_RGB[t.i % 5];
-      const baseV = toV(t.w.x, fy, t.w.z), knotV = toV(t.w.x, bY - 0.2, t.w.z), c = projectView(P, toV(t.w.x, bY, t.w.z), W, H);
-      strokeView([baseV, knotV], 'rgba(255,255,255,' + 0.75 * al + ')', 1.5);
-      if (hit) {                                                         // el hilo también es zona pulsable
-        const seg = clipSegmentView(baseV, knotV);
-        if (seg) { const pa = projectView(P, seg[0], W, H), pb = projectView(P, seg[1], W, H); if (pa && pb) hit.pole = [pa, pb]; }
-      }
-      const rx = c ? 0.17 * fpx / c.depth : 0, ry = rx * 1.2;
+      // Globo pequeño que se desplaza alrededor de su punto, atado al suelo con un hilo
+      const bp = balloonPos(t.w, fy, t.i, now), rgb = BALLOON_RGB[t.i % 5];
+      const c = projectView(P, toV(bp.x, bp.y, bp.z), W, H);
+      // Tamaño en pantalla con perspectiva, pero acotado (9 px – 11 % del ancho): de cerca sigue siendo un blanco pequeño que hay que acertar
+      const rx = c ? Math.min(Math.max(BALLOON_R * fpx / c.depth, 9), W * 0.11) : 0, ry = rx * 1.2;
+      strokeView([toV(t.w.x, fy, t.w.z), toV(bp.x, bp.y - BALLOON_R * 1.2, bp.z)], 'rgba(255,255,255,' + 0.75 * al + ')', 1.5);
       if (c && on(c, Math.max(rx, ry) * 0.5 + 20)) {
         const pulse = ready ? 1 + 0.06 * Math.sin(now / 110) : 1;
         drawBalloon(c.x, c.y, rx * pulse, ry * pulse, rgb, actual ? 1 : 0.55, String(t.i + 1), ready);
-        if (hit) hit.marker = { x: c.x, y: c.y, r: Math.max(Math.max(rx, ry) * 1.1, 28) + 8 };
+        if (hit) hit.ball = { x: c.x, y: c.y, rx: rx * pulse, ry: ry * pulse };
         if (actual) {
           actx.fillStyle = ready ? '#3ddc97' : '#fff'; actx.font = '700 14px system-ui,sans-serif';
           actx.textAlign = 'center'; actx.textBaseline = 'middle';
-          actx.fillText(ready ? '¡EXPLÓTALO!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', c.x, c.y + ry + rx * 0.2 + 18);
+          actx.fillText(ready ? '¡TÓCALO!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', c.x, c.y - ry - 16);                      // encima del globo: la mira (centro) queda libre
         }
       } else if (actual) {                                               // fuera de pantalla: aviso en el borde
         const g = course.guide(odo.s.cur, odo.s.rel), right = g.turn > 0;
@@ -1065,7 +980,7 @@ class Course {
       const age = (now - q.t) / 1000, k = age / 0.9, c0 = projectView(P, toV(q.x, q.y, q.z), W, H);
       if (c0 && age < 0.25) {
         actx.strokeStyle = 'rgba(255,255,255,' + (1 - age / 0.25) * 0.9 + ')'; actx.lineWidth = 5; actx.beginPath();
-        actx.arc(c0.x, c0.y, (0.17 + age * 1.6) * fpx / c0.depth, 0, 7); actx.stroke();
+        actx.arc(c0.x, c0.y, Math.min((0.17 + age * 1.6) * fpx / c0.depth, W * 0.45), 0, 7); actx.stroke();
       }
       for (const f of q.frags) {
         const fp = projectView(P, toV(q.x + f.vx * age, q.y + f.vy * age - 1.1 * age * age, q.z + f.vz * age), W, H);
@@ -1080,18 +995,22 @@ class Course {
       }
     }
 
-    // Mano detectada con la profundidad: puntos de la mano y una aguja en la punta
-    const hl = hand.last;
-    if (hl && now - hl.t < 150) {
-      actx.fillStyle = 'rgba(80,200,255,.3)';
-      for (const q of hl.pts) { actx.beginPath(); actx.arc(q.nx * W, q.ny * H, 5, 0, 7); actx.fill(); }
-      const tx = hl.tip.nx * W, ty = hl.tip.ny * H, L = Math.max(46, 0.16 * fpx / hl.tip.d), ux = 0.3, uy = -0.954;   // aguja inclinada hacia arriba
-      const ax = tx - ux * L, ay = ty - uy * L, lw = Math.max(2.5, L * 0.045);
-      actx.strokeStyle = 'rgba(0,0,0,.45)'; actx.lineWidth = lw + 2.5; actx.beginPath(); actx.moveTo(ax, ay); actx.lineTo(tx, ty); actx.stroke();
-      actx.strokeStyle = '#e4eaf1'; actx.lineWidth = lw; actx.beginPath(); actx.moveTo(ax, ay); actx.lineTo(tx, ty); actx.stroke();
-      actx.strokeStyle = '#e4eaf1'; actx.lineWidth = Math.max(1.5, lw * 0.6); actx.beginPath();            // ojo de la aguja
-      actx.ellipse(ax - ux * lw * 1.6, ay - uy * lw * 1.6, lw * 0.9, lw * 2, 0.3, 0, 7); actx.stroke();
-      actx.fillStyle = '#fff'; actx.beginPath(); actx.arc(tx, ty, lw * 1.1, 0, 7); actx.fill();            // brillo en la punta
+    // Punto de mira en el centro: se vuelve verde cuando está sobre el globo y se puede explotar, ámbar si está sobre él pero lejos
+    if (!course.done) {
+      const ball = hitAR && hitAR.ball, over = !!ball && pointInEllipse(W / 2, H / 2, ball, 4);
+      const col = over ? (listo ? '#3ddc97' : '#ffb454') : 'rgba(255,255,255,.9)', cx = W / 2, cy = H / 2, r = over ? 24 : 20;
+      actx.strokeStyle = 'rgba(0,0,0,.45)'; actx.lineWidth = 5; actx.beginPath(); actx.arc(cx, cy, r, 0, 7); actx.stroke();
+      actx.strokeStyle = col; actx.lineWidth = 2.5; actx.beginPath(); actx.arc(cx, cy, r, 0, 7);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { actx.moveTo(cx + dx * (r - 6), cy + dy * (r - 6)); actx.lineTo(cx + dx * (r + 9), cy + dy * (r + 9)); }
+      actx.stroke();
+      actx.fillStyle = col; actx.beginPath(); actx.arc(cx, cy, 2.5, 0, 7); actx.fill();
+    }
+    // Toques que han fallado: una X roja que se desvanece
+    misses = misses.filter(q => now - q.t < 500);
+    for (const q of misses) {
+      const k = (now - q.t) / 500;
+      actx.strokeStyle = 'rgba(255,90,95,' + (1 - k) + ')'; actx.lineWidth = 4; actx.beginPath();
+      actx.moveTo(q.x - 12, q.y - 12); actx.lineTo(q.x + 12, q.y + 12); actx.moveTo(q.x + 12, q.y - 12); actx.lineTo(q.x - 12, q.y + 12); actx.stroke();
     }
     actx.textAlign = 'start'; actx.textBaseline = 'alphabetic';
   }
@@ -1250,16 +1169,14 @@ class Course {
 
   // ---------- Controles ----------
   app.addEventListener('beforexrselect', e => e.preventDefault());   // los toques en la interfaz no son "select" de XR
-  // Capturar: pulsar una parte del punto actual (marcador, poste o anillo en la cámara; círculo en el mapa)
+  // Disparar: en la cámara, un toque sobre el globo (o en cualquier sitio con la mira sobre él); en el mapa, el círculo del punto
   app.addEventListener('pointerdown', e => {
     if (!course || course.done || !odo.started) return;
     if (e.target && e.target.closest && e.target.closest('button')) return;
     const mb = mapC.getBoundingClientRect(), ab = arC.getBoundingClientRect();
     const inMap = e.clientX >= mb.left && e.clientX <= mb.right && e.clientY >= mb.top && e.clientY <= mb.bottom;
-    const hit = inMap
-      ? !!hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r
-      : !!hitAR && hitAt(hitAR, e.clientX - ab.left, e.clientY - ab.top);
-    if (hit) tryCapture();
+    if (inMap) { if (hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r) tryCapture(); }
+    else if (mode === 'xr') shootAR(e.clientX - ab.left, e.clientY - ab.top);
   });
   $('btnXR').addEventListener('click', startXR);
   $('btnGyro').addEventListener('click', startGyro);
@@ -1289,7 +1206,7 @@ class Course {
   addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
   addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
 
-  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, get course() { return course; }, floor, hand, get pops() { return pops; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
+  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, balloonPos, get course() { return course; }, floor, get pops() { return pops; }, get misses() { return misses; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
   checkSupport();
 })();
 </script>
