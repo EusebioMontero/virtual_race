@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1419">
+<title>Odómetro AR</title>
+<style>
+  :root { --bg:#0f1419; --fg:#e8eef4; --muted:#8a99a8; --accent:#3ddc97; --warn:#ffb454; --card:#1a232c; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; }
+  body { background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+
+  /* ---------- Pantalla de inicio ---------- */
+  #landing { max-width:520px; margin:0 auto; padding:24px 20px 48px; }
+  h1 { font-size:1.5rem; margin:0 0 8px; }
+  h2 { font-size:1rem; margin:22px 0 6px; }
+  p, li { color:var(--muted); line-height:1.5; font-size:.95rem; }
+  button { font:inherit; border:0; border-radius:12px; padding:14px 18px; font-weight:600; cursor:pointer; color:inherit; }
+  #status { margin:14px 0 10px; padding:10px 12px; border-radius:10px; background:var(--card); color:var(--muted); font-size:.92rem; }
+  #status.err { color:var(--warn); }
+  .mode { display:block; width:100%; text-align:left; background:var(--card); margin:8px 0; padding:14px 16px; }
+  .mode b { display:block; font-size:1.02rem; color:var(--fg); }
+  .mode span { display:block; font-weight:400; font-size:.85rem; color:var(--muted); margin-top:2px; line-height:1.35; }
+  .mode.main { background:var(--accent); }
+  .mode.main b { color:#06281a; }
+  .mode.main span { color:#1d4d39; }
+  .mode:disabled { opacity:.4; cursor:default; }
+  #btnCsv { display:none; width:100%; margin-top:14px; background:transparent; border:1px solid #33414f; color:var(--fg); }
+
+  /* ---------- Interfaz de medición (a pantalla completa) ---------- */
+  #app { display:none; position:fixed; inset:0; color:#fff; touch-action:none; user-select:none; -webkit-user-select:none; overflow:hidden; background:transparent; }
+  #app.gyro { background:#000; }
+  #app.sim { background:radial-gradient(circle at 50% 30%, #1e2b38, #0a0f14); }
+  #cam { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:none; }
+  #app.gyro #cam { display:block; }
+  #simtag { display:none; position:absolute; left:50%; top:38%; transform:translate(-50%,-50%); font-size:.85rem; letter-spacing:.2em; color:rgba(255,255,255,.28); }
+  #app.sim #simtag { display:block; }
+
+  #hud { position:absolute; top:0; left:0; right:0; padding:max(10px, env(safe-area-inset-top)) 10px 0; display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+  .chip { background:rgba(10,14,18,.66); border-radius:12px; padding:6px 6px 5px; text-align:center; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); min-width:0; }
+  .chip small { display:block; font-size:.6rem; letter-spacing:.05em; text-transform:uppercase; color:#b6c3cf; }
+  .chip b { display:block; font-size:1.2rem; font-variant-numeric:tabular-nums; line-height:1.25; }
+  .chip em { display:block; font-style:normal; font-size:.62rem; color:#b6c3cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #track { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 82px); left:50%; transform:translateX(-50%); background:rgba(255,180,84,.94); color:#2b1a00; font-weight:600; font-size:.8rem; padding:4px 12px; border-radius:20px; display:none; white-space:nowrap; }
+
+  #panel { position:absolute; left:0; right:0; bottom:0; height:44%; background:rgba(10,14,18,.84); display:flex; flex-direction:column; padding:8px 10px max(10px, env(safe-area-inset-bottom)); gap:8px; }
+  #mapwrap { flex:1; min-height:0; border-radius:12px; overflow:hidden; background:#0b1015; }
+  #map { width:100%; height:100%; display:block; }
+  #btns { display:flex; gap:8px; }
+  #btns button { padding:12px 8px; font-size:.92rem; background:#2a3541; }
+  #btnStart { flex:1.5; background:var(--accent) !important; color:#06281a; }
+  #btnMap { flex:1.2; }
+  #btnExit { flex:.8; }
+
+  #simctl { display:none; position:absolute; left:10px; bottom:calc(44% + 10px); gap:8px; }
+  #app.sim #simctl { display:flex; }
+  #simctl button { width:58px; height:58px; padding:0; font-size:1.4rem; background:rgba(42,53,65,.9); }
+  #simctl button.on { background:var(--accent); color:#06281a; }
+
+  @media (orientation:landscape) {
+    #panel { left:auto; width:46%; height:100%; }
+    #hud { right:46%; }
+    #track { left:27%; }
+    #simctl { bottom:10px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="landing">
+  <h1>Odómetro AR</h1>
+  <p>Pulsa <b>Marcar inicio</b> y la página calcula cuántos grados giras y cuántos metros avanzas desde ese punto, con un mapa cenital del recorrido.</p>
+  <div id="status">Comprobando compatibilidad…</div>
+
+  <button id="btnXR" class="mode main" disabled>
+    <b>AR completo (ARCore)</b>
+    <span>Giro y metros reales con la cámara del móvil. Solo Chrome en Android.</span>
+  </button>
+  <button id="btnGyro" class="mode" disabled>
+    <b>Cámara + giroscopio</b>
+    <span>Mide solo el giro (no hay distancia). Funciona en iPhone y Android.</span>
+  </button>
+  <button id="btnSim" class="mode">
+    <b>Simulador</b>
+    <span>Un robot virtual que mueves con botones o flechas del teclado, para probar la interfaz.</span>
+  </button>
+  <button id="btnCsv">Descargar último recorrido (CSV)</button>
+
+  <h2>Consejos</h2>
+  <ul>
+    <li>Hay que abrir la página por <b>HTTPS</b> (por ejemplo GitHub Pages).</li>
+    <li>Apunta a zonas con textura y buena luz: el contraluz fuerte y las superficies lisas empeoran el tracking.</li>
+    <li>En el mapa, <b>arriba</b> es la dirección que tenías al marcar el inicio (o tu rumbo actual, con el botón «Mapa»).</li>
+  </ul>
+</div>
+
+<div id="app">
+  <video id="cam" playsinline muted autoplay></video>
+  <div id="simtag">SIMULADOR</div>
+  <div id="hud">
+    <div class="chip"><small>Giro</small><b id="vRot">—</b><em id="sRot">&nbsp;</em></div>
+    <div class="chip"><small>Recorrido</small><b id="vDist">—</b><em id="sDist">&nbsp;</em></div>
+    <div class="chip"><small>En línea recta</small><b id="vStraight">—</b><em id="sStraight">&nbsp;</em></div>
+  </div>
+  <div id="track"></div>
+  <div id="simctl">
+    <button id="kLeft" aria-label="Girar a la izquierda">◀</button>
+    <button id="kUp" aria-label="Avanzar">▲</button>
+    <button id="kRight" aria-label="Girar a la derecha">▶</button>
+  </div>
+  <div id="panel">
+    <div id="mapwrap"><canvas id="map"></canvas></div>
+    <div id="btns">
+      <button id="btnStart">Marcar inicio</button>
+      <button id="btnMap">Mapa: inicio ↑</button>
+      <button id="btnExit">Salir</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ==== LÓGICA PURA (sin DOM, probada con Node) ==== */
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+
+// Lleva un ángulo en grados al rango [-180, 180)
+const wrap180 = a => { a = (a + 180) % 360; if (a < 0) a += 360; return a - 180; };
+
+/*
+ * Rumbo (grados, positivo = hacia la derecha / sentido horario visto desde arriba)
+ * a partir de los vectores "adelante" (f) y "arriba" (u) del dispositivo, en un mundo
+ * con x = derecha, y = arriba, z = hacia atrás (-z = norte inicial).
+ * Con la cámara casi vertical, f es inestable: se usa la parte superior del móvil (u).
+ */
+function headingFromVectors(f, u, prev) {
+  let hx, hz;
+  if (Math.hypot(f.x, f.z) > 0.35) { hx = f.x; hz = f.z; }
+  else {
+    const s = f.y < 0 ? 1 : -1;          // mirando al suelo: la parte superior apunta adelante
+    hx = s * u.x; hz = s * u.z;
+    if (Math.hypot(hx, hz) < 0.05) return prev;
+  }
+  return Math.atan2(hx, -hz) * R2D;
+}
+
+// Vectores adelante/arriba a partir del cuaternión de WebXR (la cámara mira a -Z, arriba es +Y)
+function xrVectors(q) {
+  const { x, y, z, w } = q;
+  return {
+    f: { x: -2 * (x * z + w * y), y: -2 * (y * z - w * x), z: -(1 - 2 * (x * x + y * y)) },
+    u: { x: 2 * (x * y - w * z), y: 1 - 2 * (x * x + z * z), z: 2 * (y * z + w * x) }
+  };
+}
+
+// Lo mismo a partir de los ángulos alpha/beta/gamma de DeviceOrientation (tierra: x este, y norte, z arriba)
+function eulerVectors(aDeg, bDeg, gDeg) {
+  const a = aDeg * D2R, b = bDeg * D2R, g = gDeg * D2R;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  const c3 = { e: ca * sg + sa * sb * cg, n: sa * sg - ca * sb * cg, up: cb * cg };   // tercera columna de R
+  const c2 = { e: -sa * cb, n: ca * cb, up: sb };                                      // segunda columna de R
+  return {
+    f: { x: -c3.e, y: -c3.up, z: c3.n },    // cámara trasera = -columna 3
+    u: { x: c2.e, y: c2.up, z: -c2.n }
+  };
+}
+
+/*
+ * Odómetro: a partir del momento de arm() + primera muestra válida toma el punto y el rumbo
+ * de inicio como origen. Ejes del mapa: r = derecha, f = adelante (respecto al rumbo inicial).
+ * Muestra de entrada: { x, z, h, ok } en el mundo (x derecha, z hacia atrás), h en grados.
+ */
+class Odometer {
+  constructor(opts = {}) { this.minStep = opts.minStep ?? 0.02; this.clear(); }
+  clear() { this.pending = false; this.started = false; this.lost = false; this.s = null; }
+  arm() { this.clear(); this.pending = true; }
+  update(p) {
+    if (!p) { if (this.started) this.lost = true; return; }
+    if (this.pending && p.ok) {
+      this.s = { p0: { x: p.x, z: p.z }, h0: p.h, lastH: p.h, total: 0, rel: 0, dist: 0, straight: 0,
+                 last: { r: 0, f: 0 }, cur: { r: 0, f: 0 }, path: [{ r: 0, f: 0 }] };
+      this.pending = false; this.started = true; this.lost = false;
+    }
+    const s = this.s;
+    if (!s) return;
+    if (!p.ok) { this.lost = true; return; }
+    this.lost = false;
+
+    const dx = p.x - s.p0.x, dz = p.z - s.p0.z, h0 = s.h0 * D2R;
+    const r = dx * Math.cos(h0) + dz * Math.sin(h0);      // derecha del rumbo inicial
+    const f = dx * Math.sin(h0) - dz * Math.cos(h0);      // adelante del rumbo inicial
+    s.cur = { r, f };
+    s.straight = Math.hypot(r, f);
+
+    s.total += wrap180(p.h - s.lastH);                    // giro acumulado (puede pasar de 360°)
+    s.lastH = p.h;
+    s.rel = wrap180(p.h - s.h0);                          // giro respecto al inicio, -180..180
+
+    const step = Math.hypot(r - s.last.r, f - s.last.f);  // se ignora el ruido por debajo de minStep
+    if (step >= this.minStep) {
+      s.dist += step; s.last = { r, f }; s.path.push({ r, f });
+      if (s.path.length > 6000) s.path = s.path.filter((_, i) => i % 2 === 0 || i === s.path.length - 1);
+    }
+  }
+}
+
+/* ==== APLICACIÓN ==== */
+(() => {
+  const $ = id => document.getElementById(id);
+  const app = $('app'), mapC = $('map'), ctx = mapC.getContext('2d'), cam = $('cam');
+  const odo = new Odometer();
+
+  let mode = null;                 // 'xr' | 'gyro' | 'sim'
+  let mapMode = 'start';           // 'start' (arriba = rumbo inicial) | 'head' (arriba = rumbo actual)
+  let raf = 0, lastT = 0, lastHeading = 0, wakeLock = null;
+  let xr = null;                   // { session, gl, refSpace }
+  let camStream = null;
+  const gyro = { a: 0, b: 0, g: 0, has: false };
+  const sim = { x: 0, z: 0, h: 0, up: false, left: false, right: false };
+  let lastRun = null;
+
+  function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = err ? 'err' : ''; }
+
+  // ---------- Compatibilidad ----------
+  async function checkSupport() {
+    const secure = window.isSecureContext;
+    let xrOk = false;
+    if (secure && navigator.xr) { try { xrOk = await navigator.xr.isSessionSupported('immersive-ar'); } catch (e) {} }
+    const camOk = secure && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    $('btnXR').disabled = !xrOk;
+    $('btnGyro').disabled = !camOk;
+    if (xrOk) setStatus('ARCore disponible: puedes usar el modo completo.');
+    else if (!secure) setStatus('Abre la página por HTTPS para usar cámara y AR. Mientras tanto puedes probar el simulador.', true);
+    else if (!navigator.xr) setStatus('Este navegador no soporta WebXR (hace falta Chrome en Android). Puedes usar cámara + giroscopio o el simulador.', true);
+    else setStatus('Tu dispositivo no ofrece AR en el navegador (¿ARCore instalado?). Puedes usar cámara + giroscopio o el simulador.', true);
+  }
+
+  // ---------- Arranque y parada ----------
+  function openApp(m) {
+    mode = m; odo.clear(); resetHud(); lastHeading = 0;
+    mapMode = 'start'; $('btnMap').textContent = 'Mapa: inicio ↑';
+    app.className = m; app.style.display = 'block';
+    if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wakeLock = l; }).catch(() => {});
+  }
+
+  function endAll() {
+    if (odo.started && odo.s.path.length > 1) {
+      const s = odo.s;
+      lastRun = { dist: s.dist, straight: s.straight, rel: s.rel, total: s.total, path: s.path.slice() };
+      $('btnCsv').style.display = 'block';
+    }
+    cancelAnimationFrame(raf);
+    if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; cam.srcObject = null; }
+    window.removeEventListener('deviceorientation', onOri, true);
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    xr = null; mode = null; app.style.display = 'none'; app.className = '';
+    sim.up = sim.left = sim.right = false;
+    $('btnStart').textContent = 'Marcar inicio';
+  }
+
+  async function startXR() {
+    if (mode) return;
+    let session;
+    try {
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['local'],
+        optionalFeatures: ['dom-overlay'],
+        domOverlay: { root: app }
+      });
+    } catch (e) { setStatus('No se pudo iniciar AR: ' + e.message, true); return; }
+
+    if (!session.domOverlayState) {
+      session.end();
+      setStatus('Este navegador no puede mostrar la interfaz sobre la cámara AR. Actualiza Chrome o usa el modo cámara + giroscopio.', true);
+      return;
+    }
+    try {
+      const gl = document.createElement('canvas').getContext('webgl', { xrCompatible: true, alpha: true });
+      session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+      const refSpace = await session.requestReferenceSpace('local');
+      xr = { session, gl, refSpace };
+    } catch (e) {
+      session.end();
+      setStatus('No se pudo preparar la sesión AR: ' + e.message, true);
+      return;
+    }
+    session.addEventListener('end', endAll);
+    openApp('xr');
+    session.requestAnimationFrame(onXRFrame);
+  }
+
+  async function startGyro() {
+    if (mode) return;
+    try {
+      // En iOS el permiso de movimiento debe pedirse directamente desde el toque del usuario
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const r = await DeviceOrientationEvent.requestPermission();
+        if (r !== 'granted') throw new Error('permiso de movimiento denegado');
+      }
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    } catch (e) { setStatus('No se pudo activar cámara y sensores: ' + e.message, true); return; }
+    cam.srcObject = camStream;
+    cam.play().catch(() => {});
+    gyro.has = false;
+    window.addEventListener('deviceorientation', onOri, true);
+    openApp('gyro');
+    lastT = performance.now(); raf = requestAnimationFrame(loop);
+  }
+
+  function startSim() {
+    if (mode) return;
+    sim.x = sim.z = sim.h = 0;
+    openApp('sim');
+    lastT = performance.now(); raf = requestAnimationFrame(loop);
+  }
+
+  // ---------- Fuentes de pose ----------
+  function onXRFrame(t, frame) {
+    if (!xr) return;
+    xr.session.requestAnimationFrame(onXRFrame);
+
+    // La cámara la compone el navegador; solo se limpia el framebuffer transparente
+    const gl = xr.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, xr.session.renderState.baseLayer.framebuffer);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const pose = frame.getViewerPose(xr.refSpace);
+    if (!pose) { tick(null, 'Sin pose: mueve el móvil despacio'); return; }
+    const pos = pose.transform.position, v = xrVectors(pose.transform.orientation);
+    lastHeading = headingFromVectors(v.f, v.u, lastHeading);
+    const ok = !pose.emulatedPosition;
+    tick({ x: pos.x, z: pos.z, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
+  }
+
+  function onOri(e) {
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
+    gyro.a = e.alpha; gyro.b = e.beta; gyro.g = e.gamma; gyro.has = true;
+  }
+
+  function loop(t) {
+    raf = requestAnimationFrame(loop);
+    const dt = Math.min(0.1, (t - lastT) / 1000 || 0); lastT = t;
+    if (mode === 'gyro') {
+      if (!gyro.has) { tick(null, 'Esperando el sensor de movimiento…'); return; }
+      const v = eulerVectors(gyro.a, gyro.b, gyro.g);
+      lastHeading = headingFromVectors(v.f, v.u, lastHeading);
+      tick({ x: 0, z: 0, h: lastHeading, ok: true }, '');
+    } else if (mode === 'sim') {
+      sim.h = wrap180(sim.h + ((sim.right ? 1 : 0) - (sim.left ? 1 : 0)) * 60 * dt);
+      if (sim.up) { sim.x += Math.sin(sim.h * D2R) * 0.5 * dt; sim.z -= Math.cos(sim.h * D2R) * 0.5 * dt; }
+      tick({ x: sim.x, z: sim.z, h: sim.h, ok: true }, '');
+    }
+  }
+
+  // ---------- Cada fotograma ----------
+  let lastBtnText = '';
+  function tick(p, banner) {
+    odo.update(p);
+    const tr = $('track');
+    if (banner) { tr.textContent = banner; tr.style.display = 'block'; } else tr.style.display = 'none';
+    const label = odo.started ? 'Reiniciar inicio' : (odo.pending ? 'Esperando…' : 'Marcar inicio');
+    if (label !== lastBtnText) { $('btnStart').textContent = label; lastBtnText = label; }
+    updateHud();
+    drawMap();
+  }
+
+  function resetHud() {
+    $('vRot').textContent = $('vDist').textContent = $('vStraight').textContent = '—';
+    $('sRot').innerHTML = $('sDist').innerHTML = $('sStraight').innerHTML = '&nbsp;';
+  }
+
+  function updateHud() {
+    if (!odo.started) return;
+    const s = odo.s, noPos = mode === 'gyro';
+    $('vRot').textContent = (s.rel >= 0 ? '↻ ' : '↺ ') + Math.abs(s.rel).toFixed(0) + '°';
+    $('sRot').textContent = 'acumulado ' + s.total.toFixed(0) + '°';
+    if (noPos) {
+      $('vDist').textContent = $('vStraight').textContent = '—';
+      $('sDist').textContent = 'solo giro'; $('sStraight').textContent = 'solo giro';
+    } else {
+      $('vDist').textContent = s.dist.toFixed(2) + ' m';
+      $('sDist').textContent = '↑ ' + s.cur.f.toFixed(2) + ' · → ' + s.cur.r.toFixed(2);
+      $('vStraight').textContent = s.straight.toFixed(2) + ' m';
+      $('sStraight').textContent = 'desde el inicio';
+    }
+  }
+
+  // ---------- Mapa cenital ----------
+  function niceStep(span) {
+    for (const s of [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]) if (span / s <= 10) return s;
+    return 200;
+  }
+
+  function drawMap() {
+    const dpr = window.devicePixelRatio || 1, w = mapC.clientWidth, h = mapC.clientHeight;
+    if (!w || !h) return;
+    const W = Math.round(w * dpr), H = Math.round(h * dpr);
+    if (mapC.width !== W || mapC.height !== H) { mapC.width = W; mapC.height = H; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#0b1015'; ctx.fillRect(0, 0, w, h);
+
+    const started = odo.started, s = odo.s;
+    const cur = started ? s.cur : { r: 0, f: 0 };
+    const rel = started ? s.rel * D2R : 0;
+    const pts = started ? s.path : [{ r: 0, f: 0 }];
+
+    // Encuadre: o bien centrado en el recorrido (arriba = rumbo inicial) o en el robot (arriba = su rumbo)
+    let cR, cF, scale, rot = 0;
+    if (mapMode === 'head' && started) {
+      let rad = 1.5;
+      for (const q of pts) rad = Math.max(rad, Math.hypot(q.r - cur.r, q.f - cur.f));
+      scale = Math.min(w, h) / 2 * 0.85 / rad; cR = cur.r; cF = cur.f; rot = -rel;
+    } else {
+      let a = 0, b = 0, c = 0, d = 0;
+      for (const q of pts.concat([cur])) { a = Math.min(a, q.r); b = Math.max(b, q.r); c = Math.min(c, q.f); d = Math.max(d, q.f); }
+      scale = Math.min(w / (Math.max(b - a, 2) * 1.3), h / (Math.max(d - c, 2) * 1.3));
+      cR = (a + b) / 2; cF = (c + d) / 2;
+    }
+
+    ctx.save();
+    ctx.translate(w / 2, h / 2); ctx.rotate(rot); ctx.scale(scale, -scale); ctx.translate(-cR, -cF);
+    const half = Math.hypot(w, h) / 2 / scale, step = niceStep(half * 2);
+
+    ctx.lineWidth = 1 / scale; ctx.strokeStyle = 'rgba(255,255,255,.08)';
+    ctx.beginPath();
+    for (let r = Math.floor((cR - half) / step) * step; r <= cR + half; r += step) { ctx.moveTo(r, cF - half); ctx.lineTo(r, cF + half); }
+    for (let f = Math.floor((cF - half) / step) * step; f <= cF + half; f += step) { ctx.moveTo(cR - half, f); ctx.lineTo(cR + half, f); }
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(255,255,255,.22)';              // ejes que pasan por el inicio
+    ctx.beginPath(); ctx.moveTo(0, cF - half); ctx.lineTo(0, cF + half); ctx.moveTo(cR - half, 0); ctx.lineTo(cR + half, 0); ctx.stroke();
+
+    if (started) {
+      ctx.strokeStyle = '#3ddc97'; ctx.lineWidth = 3 / scale; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.beginPath();
+      pts.forEach((q, i) => i ? ctx.lineTo(q.r, q.f) : ctx.moveTo(q.r, q.f));
+      ctx.lineTo(cur.r, cur.f);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = '#ffb454'; ctx.beginPath(); ctx.arc(0, 0, 6 / scale, 0, 7); ctx.fill();   // inicio
+
+    // Flecha de posición y rumbo actual, a tamaño de pantalla
+    ctx.save();
+    ctx.translate(cur.r, cur.f); ctx.scale(1 / scale, -1 / scale); ctx.rotate(rel);
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#06281a'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, -13); ctx.lineTo(9, 9); ctx.lineTo(0, 4); ctx.lineTo(-9, 9); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+    ctx.restore();
+
+    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '11px system-ui,sans-serif'; ctx.textAlign = 'start';
+    ctx.fillText('cuadrícula: ' + step + ' m', 8, h - 8);
+    ctx.fillText(mapMode === 'head' && started ? '▲ rumbo actual' : '▲ rumbo del inicio', 8, 16);
+    if (!started) {
+      ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.font = '600 14px system-ui,sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(odo.pending ? 'Esperando tracking…' : 'Pulsa «Marcar inicio»', w / 2, h / 2);
+    }
+  }
+
+  // ---------- Exportar ----------
+  function downloadCsv() {
+    if (!lastRun) return;
+    const r = lastRun;
+    const rows = ['# Odometro AR',
+      '# recorrido_m,' + r.dist.toFixed(3), '# recto_m,' + r.straight.toFixed(3),
+      '# giro_final_grados,' + r.rel.toFixed(1), '# giro_acumulado_grados,' + r.total.toFixed(1),
+      'punto,derecha_m,adelante_m'];
+    r.path.forEach((q, i) => rows.push(i + ',' + q.r.toFixed(3) + ',' + q.f.toFixed(3)));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
+    a.download = 'recorrido.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  // ---------- Controles ----------
+  app.addEventListener('beforexrselect', e => e.preventDefault());   // los toques en la interfaz no son "select" de XR
+  $('btnXR').addEventListener('click', startXR);
+  $('btnGyro').addEventListener('click', startGyro);
+  $('btnSim').addEventListener('click', startSim);
+  $('btnCsv').addEventListener('click', downloadCsv);
+  $('btnStart').addEventListener('click', () => { odo.arm(); resetHud(); });
+  $('btnMap').addEventListener('click', () => {
+    mapMode = mapMode === 'start' ? 'head' : 'start';
+    $('btnMap').textContent = mapMode === 'start' ? 'Mapa: inicio ↑' : 'Mapa: rumbo ↑';
+  });
+  $('btnExit').addEventListener('click', () => { if (mode === 'xr' && xr) xr.session.end(); else endAll(); });
+
+  // Simulador: botones mantenidos y teclado
+  const hold = (id, key) => {
+    const el = $(id), set = v => { sim[key] = v; el.classList.toggle('on', v); };
+    el.addEventListener('pointerdown', e => { e.preventDefault(); set(true); });
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => el.addEventListener(ev, () => set(false)));
+  };
+  hold('kUp', 'up'); hold('kLeft', 'left'); hold('kRight', 'right');
+  const keys = { ArrowUp: 'up', w: 'up', ArrowLeft: 'left', a: 'left', ArrowRight: 'right', d: 'right' };
+  addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
+  addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
+
+  checkSupport();
+})();
+</script>
+</body>
+</html>
