@@ -58,7 +58,7 @@
   .chip b { display:block; font-size:1.2rem; font-variant-numeric:tabular-nums; line-height:1.25; }
   .chip em { display:block; font-style:normal; font-size:.62rem; color:#b6c3cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #game { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 80px); left:10px; right:10px; display:none; background:rgba(10,14,18,.7); border-radius:12px; padding:6px 10px; text-align:center; font-size:.92rem; font-weight:600; font-variant-numeric:tabular-nums; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); }
-  #game.done { background:rgba(61,220,151,.92); color:#06281a; }
+  #game.done, #game.ready { background:rgba(61,220,151,.92); color:#06281a; }
   #track { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 122px); left:50%; transform:translateX(-50%); background:rgba(255,180,84,.94); color:#2b1a00; font-weight:600; font-size:.8rem; padding:4px 12px; border-radius:20px; display:none; white-space:nowrap; }
 
   #panel { position:absolute; left:0; right:0; bottom:0; height:44%; background:rgba(10,14,18,.84); display:flex; flex-direction:column; padding:8px 10px max(10px, env(safe-area-inset-bottom)); gap:8px; }
@@ -97,7 +97,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: acércate a menos de 0,5 m y pulsa el punto para capturarlo. Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -105,7 +105,7 @@
   </button>
   <button id="btnSim" class="mode">
     <b>Simulador</b>
-    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a cada uno.</span>
+    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a menos de 0,5 m de cada uno y pulsar el punto en el mapa para capturarlo.</span>
   </button>
   <button id="btnCsv">Descargar último recorrido (CSV)</button>
 
@@ -386,10 +386,27 @@ class Odometer {
   }
 }
 
+// Distancia de un punto (px, py) al segmento a–b (todo en píxeles)
+function distToSegment(px, py, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+  const t = l2 < 1e-12 ? 0 : Math.max(0, Math.min(1, ((px - a.x) * dx + (py - a.y) * dy) / l2));
+  return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy));
+}
+
+// ¿Está (px, py) dentro del polígono `poly` (lista de {x, y})? Algoritmo del rayo
+function pointInPolygon(px, py, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > py) !== (b.y > py) && px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
 /*
  * Carrera de puntos: n puntos aleatorios en coordenadas del mapa (r = derecha, f = adelante
  * respecto al inicio), encadenados a 1,5–3 m unos de otros y dentro de un cuadrado de ±limit m.
- * Hay que llegar a cada uno (a menos de `radius` m) en orden; el siguiente aparece al alcanzar el actual.
+ * Hay que acercarse a cada uno (a menos de `radius` m) y pulsarlo, en orden; el siguiente aparece al capturar el actual.
  */
 class Course {
   constructor(n = 5, opts = {}) {
@@ -413,11 +430,14 @@ class Course {
   }
   start(now) { this.t0 = now; }
   get target() { return this.done ? null : this.pts[this.idx]; }
-  // Devuelve true si en esta muestra se alcanzó el punto actual
-  update(cur, now) {
-    if (this.done) return false;
-    const t = this.pts[this.idx];
-    if (Math.hypot(t.r - cur.r, t.f - cur.f) > this.radius) return false;
+  // ¿Está el robot a menos de `radius` m del punto actual? (condición para poder capturarlo)
+  inRange(cur) {
+    const t = this.target;
+    return !!t && Math.hypot(t.r - cur.r, t.f - cur.f) <= this.radius;
+  }
+  // Captura el punto actual si se está a su alcance (el jugador lo pulsa); devuelve true si lo capturó
+  capture(cur, now) {
+    if (!this.inRange(cur)) return false;
     this.idx++;
     if (this.idx >= this.pts.length) { this.done = true; this.tEnd = now; }
     return true;
@@ -452,6 +472,9 @@ class Course {
   // Escaneo del entorno: 'idle' | 'scanning' | 'done' | 'poor' (poco espacio libre)
   const scan = { state: 'idle', grid: null, t0: 0, frames: 0, noDepth: 0 };
   let noteMsg = '', noteUntil = 0;   // aviso temporal en el banner
+  let hitAR = null, hitMap = null;   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
+  let wasInRange = false;            // para vibrar una vez al entrar en el radio del punto
+  let flash = null;                  // onda verde al capturar un punto: { w, t, R }
 
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = err ? 'err' : ''; }
 
@@ -610,7 +633,10 @@ class Course {
     if ((mode === 'sim' || mode === 'xr') && odo.started) {
       // En AR real el espacio es menor (±4 m) y la posición tiene más ruido (radio de 0,5 m)
       if (!course) { course = makeCourse(); course.start(now); }
-      else if (course.update(odo.s.cur, now) && navigator.vibrate) navigator.vibrate(60);
+      // Los puntos ya no se capturan solos: hay que estar a menos de `radius` m y pulsarlos (tryCapture)
+      const inR = course.inRange(odo.s.cur);
+      if (inR && !wasInRange && navigator.vibrate) navigator.vibrate(25);   // aviso táctil al entrar en el radio
+      wasInRange = inR;
     }
     updateGame(now);
     const tr = $('track'), msg = banner || (now < noteUntil ? noteMsg : '');
@@ -689,7 +715,7 @@ class Course {
 
   // Carrera: con un escaneo válido, puntos en sitios libres y alcanzables; si no, aleatorios
   function makeCourse() {
-    const opts = mode === 'xr' ? { radius: 0.5, limit: 4 } : {};
+    const opts = { radius: 0.5, limit: mode === 'xr' ? 4 : 5 };   // capturar: a menos de 0,5 m (también en el simulador)
     if (mode === 'xr' && scan.state === 'done' && scan.grid) {
       const p0 = odo.s.p0, w = scan.grid.pickPoints(5, { x: p0.x, z: p0.z }, Math.random, opts.radius);
       if (w.length >= 3) return new Course(5, Object.assign({}, opts, { pts: w.map(q => odo.worldToMap(q.x, q.z)) }));
@@ -724,10 +750,33 @@ class Course {
       g.textContent = '¡Completado en ' + course.elapsed(now).toFixed(1) + ' s! · recorrido ' + odo.s.dist.toFixed(1) + ' m · «Reiniciar inicio» = otra carrera';
       return;
     }
-    g.className = '';
-    const gd = course.guide(odo.s.cur, odo.s.rel);
+    const gd = course.guide(odo.s.cur, odo.s.rel), inR = course.inRange(odo.s.cur);
+    g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
-    g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · ' + turn + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+    g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
+      + (inR ? '¡al alcance! Pulsa el punto' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+  }
+
+  // ---------- Capturar un punto: a menos de 0,5 m y pulsando una parte del punto ----------
+  function hitAt(h, x, y) {
+    if (h.marker && Math.hypot(x - h.marker.x, y - h.marker.y) <= h.marker.r) return true;     // marcador con el número
+    if (h.pole && distToSegment(x, y, h.pole[0], h.pole[1]) <= 26) return true;                 // poste
+    return !!h.ring && pointInPolygon(x, y, h.ring);                                             // anillo del suelo
+  }
+
+  function tryCapture() {
+    if (!course || course.done || !odo.started) return;
+    const t = course.target, cur = odo.s.cur, now = performance.now(), idx = course.idx;
+    if (!course.inRange(cur)) {
+      const d = Math.hypot(t.r - cur.r, t.f - cur.f);
+      showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para capturarlo');
+      return;
+    }
+    const w = odo.mapToWorld(t.r, t.f);
+    course.capture(cur, now);
+    flash = { w, t: now, R: course.radius };
+    if (navigator.vibrate) navigator.vibrate(course.done ? [60, 40, 60] : 60);
+    if (!course.done) showNote('Punto ' + (idx + 1) + ' capturado ✓');
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -764,6 +813,7 @@ class Course {
     if (arC.width !== cw || arC.height !== ch) { arC.width = cw; arC.height = ch; }
     actx.setTransform(dpr, 0, 0, dpr, 0, 0);
     actx.clearRect(0, 0, W, H);
+    hitAR = null;
     if (!pose || !pose.views.length) return;
     const cam = pose.transform.position;
     if (floor.y == null) floor.y = cam.y - 1.3;         // hasta detectar el suelo se supone el móvil a 1,3 m
@@ -804,7 +854,14 @@ class Course {
         actx.beginPath(); actx.arc(p.x, p.y, Math.max(2, 0.06 * fpx / p.depth * (blocked ? 1.8 : 1)), 0, 7); actx.fill();
       }
     }
+    // Onda verde al capturar un punto
+    if (flash) {
+      const k = (now - flash.t) / 700;
+      if (k >= 1) flash = null;
+      else strokeView(ringAt(flash.w, flash.R * (1 + k * 1.2)), 'rgba(61,220,151,' + (1 - k) + ')', 6);
+    }
     if (!course || !odo.started) return;
+    const listo = !course.done && course.inRange(odo.s.cur);   // a menos de `radius` m del punto actual: ya se puede pulsar
 
     // Puntos pendientes, de más lejos a más cerca
     const tg = [];
@@ -826,33 +883,51 @@ class Course {
     }
 
     for (const t of tg) {
-      const actual = !course.done && t.i === course.idx, col = actual ? '255,180,84' : '255,255,255', al = actual ? 1 : 0.45;
-      const R = course.radius;
+      const actual = !course.done && t.i === course.idx, ready = actual && listo;
+      const col = ready ? '61,220,151' : actual ? '255,180,84' : '255,255,255', al = actual ? 1 : 0.45;
+      const R = course.radius, hit = actual ? { marker: null, pole: null, ring: null } : null;
+      if (hit) hitAR = hit;                                            // zonas pulsables del punto actual
 
       // Anillo en el suelo (relleno translúcido si entero está delante de la cámara)
       const ring = ringAt(t.w, R), proj = ring.map(pv => projectView(P, pv, W, H));
       if (proj.every(Boolean)) {
-        actx.fillStyle = 'rgba(' + col + ',' + (actual ? 0.22 : 0.08) + ')'; actx.beginPath();
+        actx.fillStyle = 'rgba(' + col + ',' + (ready ? 0.32 : actual ? 0.22 : 0.08) + ')'; actx.beginPath();
         proj.forEach((p, k) => k ? actx.lineTo(p.x, p.y) : actx.moveTo(p.x, p.y)); actx.closePath(); actx.fill();
+        if (hit) hit.ring = proj;
       }
       strokeView(ring, 'rgba(' + col + ',' + al + ')', actual ? 4 : 2);
-      if (actual) {                                                     // onda que se expande
-        const k = (now % 1200) / 1200;
-        strokeView(ringAt(t.w, R * (1 + k * 0.8)), 'rgba(255,180,84,' + (1 - k) * 0.8 + ')', 3);
+      if (actual) {                                                     // onda que se expande (más rápida al estar a su alcance)
+        const per = ready ? 600 : 1200, k = (now % per) / per;
+        strokeView(ringAt(t.w, R * (1 + k * 0.8)), 'rgba(' + col + ',' + (1 - k) * 0.8 + ')', 3);
       }
 
       // Poste vertical con el número arriba
-      strokeView([toV(t.w.x, fy, t.w.z), toV(t.w.x, fy + 1.6, t.w.z)], 'rgba(' + col + ',' + 0.85 * al + ')', actual ? 3 : 2);
-      const tp = projectView(P, toV(t.w.x, fy + 1.6, t.w.z), W, H), bp = projectView(P, toV(t.w.x, fy, t.w.z), W, H);
-      const mp = on(tp, 30) ? tp : (on(bp, 30) ? bp : null);              // marcador arriba, o en la base si el poste se sale
+      const base = toV(t.w.x, fy, t.w.z), top = toV(t.w.x, fy + 1.6, t.w.z);
+      strokeView([base, top], 'rgba(' + col + ',' + 0.85 * al + ')', ready ? 5 : actual ? 3 : 2);
+      const tp = projectView(P, top, W, H), bp = projectView(P, base, W, H);
+      let pa = null, pb = null;                                          // tramo visible del poste (delante de la cámara)
+      if (hit) {
+        const seg = clipSegmentView(base, top);
+        if (seg) { pa = projectView(P, seg[0], W, H); pb = projectView(P, seg[1], W, H); }
+        if (pa && pb) hit.pole = [pa, pb];
+      }
+      let mp = on(tp, 30) ? tp : (on(bp, 30) ? bp : null);              // marcador arriba, o en la base si el poste se sale
+      if (!mp && pa && pb) {                                             // de cerca: en el trozo del poste que sí se ve
+        for (let k = 1; k < 10 && !mp; k++) {
+          const q = { x: pa.x + (pb.x - pa.x) * k / 10, y: pa.y + (pb.y - pa.y) * k / 10, depth: pa.depth + (pb.depth - pa.depth) * k / 10 };
+          if (on(q, 30)) mp = q;
+        }
+      }
       if (mp) {
-        const rpx = Math.max(11, 0.2 * fpx / mp.depth);
+        let rpx = Math.max(actual ? 16 : 11, 0.2 * fpx / mp.depth);
+        if (ready) rpx *= 1 + 0.15 * Math.sin(now / 110);               // late cuando se puede pulsar
+        if (hit) hit.marker = { x: mp.x, y: mp.y, r: Math.max(rpx, 22) + 14 };
         actx.fillStyle = 'rgba(' + col + ',' + (actual ? 0.95 : 0.6) + ')'; actx.beginPath(); actx.arc(mp.x, mp.y, rpx, 0, 7); actx.fill();
-        actx.fillStyle = '#2b1a00'; actx.font = '700 ' + Math.round(rpx * 1.1) + 'px system-ui,sans-serif';
+        actx.fillStyle = ready ? '#06281a' : '#2b1a00'; actx.font = '700 ' + Math.round(rpx * 1.1) + 'px system-ui,sans-serif';
         actx.textAlign = 'center'; actx.textBaseline = 'middle'; actx.fillText(String(t.i + 1), mp.x, mp.y + 1);
         if (actual) {
-          actx.fillStyle = '#fff'; actx.font = '700 14px system-ui,sans-serif';
-          actx.fillText(Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', mp.x, mp.y + rpx + 14);
+          actx.fillStyle = ready ? '#3ddc97' : '#fff'; actx.font = '700 14px system-ui,sans-serif';
+          actx.fillText(ready ? '¡PULSA!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', mp.x, mp.y + rpx + 14);
         }
       } else if (actual) {                                               // fuera de pantalla: aviso en el borde
         const g = course.guide(odo.s.cur, odo.s.rel), right = g.turn > 0;
@@ -875,6 +950,7 @@ class Course {
   }
 
   function drawMap() {
+    hitMap = null;
     const dpr = window.devicePixelRatio || 1, w = mapC.clientWidth, h = mapC.clientHeight;
     if (!w || !h) return;
     const W = Math.round(w * dpr), H = Math.round(h * dpr);
@@ -899,6 +975,14 @@ class Course {
       for (const q of pts.concat([cur], cpts)) { a = Math.min(a, q.r); b = Math.max(b, q.r); c = Math.min(c, q.f); d = Math.max(d, q.f); }
       scale = Math.min(w / (Math.max(b - a, 2) * 1.3), h / (Math.max(d - c, 2) * 1.3));
       cR = (a + b) / 2; cF = (c + d) / 2;
+    }
+
+    // Zona pulsable del punto actual en píxeles del lienzo (misma transformación que se aplica abajo)
+    const listo = !!course && started && course.inRange(cur), tgt = course && started ? course.target : null;
+    if (tgt) {
+      const x1 = (tgt.r - cR) * scale, y1 = -(tgt.f - cF) * scale;
+      hitMap = { x: w / 2 + x1 * Math.cos(rot) - y1 * Math.sin(rot), y: h / 2 + x1 * Math.sin(rot) + y1 * Math.cos(rot),
+                 r: Math.max(course.radius * scale, 30) };
     }
 
     ctx.save();
@@ -940,8 +1024,8 @@ class Course {
       cpts.forEach((q, i) => {
         const hecho = course.done || i < course.idx, actual = !course.done && i === course.idx;
         ctx.lineWidth = 2 / scale;
-        ctx.strokeStyle = hecho ? 'rgba(61,220,151,.45)' : actual ? '#ffb454' : 'rgba(255,255,255,.35)';
-        ctx.fillStyle = hecho ? 'rgba(61,220,151,.12)' : actual ? 'rgba(255,180,84,.18)' : 'rgba(255,255,255,.05)';
+        ctx.strokeStyle = hecho ? 'rgba(61,220,151,.45)' : actual ? (listo ? '#3ddc97' : '#ffb454') : 'rgba(255,255,255,.35)';
+        ctx.fillStyle = hecho ? 'rgba(61,220,151,.12)' : actual ? (listo ? 'rgba(61,220,151,.32)' : 'rgba(255,180,84,.18)') : 'rgba(255,255,255,.05)';
         ctx.beginPath(); ctx.arc(q.r, q.f, course.radius, 0, 7); ctx.fill(); ctx.stroke();
         if (actual) {
           const k = (now % 1200) / 1200;
@@ -951,6 +1035,10 @@ class Course {
         ctx.translate(q.r, q.f); ctx.scale(1 / scale, -1 / scale); ctx.rotate(-rot);
         ctx.fillStyle = '#fff'; ctx.font = '600 13px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
         ctx.fillText(String(i + 1), 0, 0);
+        if (actual && listo) {                         // invitación a pulsar, debajo del punto
+          ctx.fillStyle = '#3ddc97'; ctx.font = '700 12px system-ui,sans-serif';
+          ctx.fillText('¡pulsa!', 0, course.radius * scale + 12);
+        }
         ctx.restore();
       });
       const t = course.target;
@@ -998,6 +1086,17 @@ class Course {
 
   // ---------- Controles ----------
   app.addEventListener('beforexrselect', e => e.preventDefault());   // los toques en la interfaz no son "select" de XR
+  // Capturar: pulsar una parte del punto actual (marcador, poste o anillo en la cámara; círculo en el mapa)
+  app.addEventListener('pointerdown', e => {
+    if (!course || course.done || !odo.started) return;
+    if (e.target && e.target.closest && e.target.closest('button')) return;
+    const mb = mapC.getBoundingClientRect(), ab = arC.getBoundingClientRect();
+    const inMap = e.clientX >= mb.left && e.clientX <= mb.right && e.clientY >= mb.top && e.clientY <= mb.bottom;
+    const hit = inMap
+      ? !!hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r
+      : !!hitAR && hitAt(hitAR, e.clientX - ab.left, e.clientY - ab.top);
+    if (hit) tryCapture();
+  });
   $('btnXR').addEventListener('click', startXR);
   $('btnGyro').addEventListener('click', startGyro);
   $('btnSim').addEventListener('click', startSim);
@@ -1025,7 +1124,7 @@ class Course {
   addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
   addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
 
-  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, get course() { return course; }, floor });   // gancho para las pruebas
+  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, get course() { return course; }, floor, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
   checkSupport();
 })();
 </script>
