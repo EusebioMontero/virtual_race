@@ -61,6 +61,7 @@
   #topstack { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 72px); left:10px; right:10px; display:flex; flex-direction:column; gap:6px; pointer-events:none; }
   #game { display:none; background:rgba(10,14,18,.7); border-radius:12px; padding:6px 10px; text-align:center; font-size:.92rem; font-weight:600; font-variant-numeric:tabular-nums; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); }
   #game.done, #game.ready { background:rgba(61,220,151,.92); color:#06281a; }
+  #game.over { background:rgba(255,90,95,.94); color:#2a0507; }
   #track { align-self:center; max-width:100%; text-align:center; background:rgba(255,180,84,.94); color:#2b1a00; font-weight:600; font-size:.8rem; padding:4px 12px; border-radius:14px; display:none; }
 
   #panel { position:absolute; left:0; right:0; bottom:0; height:44%; background:rgba(10,14,18,.84); display:flex; flex-direction:column; padding:8px 10px max(10px, env(safe-area-inset-bottom)); gap:8px; }
@@ -98,7 +99,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos pequeños que se mueven: acércate a menos de 0,5 m, apunta con el punto de mira (centro de la pantalla) y toca el globo, o toca en cualquier sitio con la mira sobre él. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos pequeños que se mueven: acércate a menos de 1 m, apunta con el punto de mira (centro de la pantalla) y toca el globo, o toca en cualquier sitio con la mira sobre él. Solo tienes 10 disparos para los 5 globos: cada toque a menos de 1 m gasta uno, aciertes o no. Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -106,7 +107,7 @@
   </button>
   <button id="btnSim" class="mode">
     <b>Simulador</b>
-    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a menos de 0,5 m de cada uno y pulsar el punto en el mapa para explotar el globo.</span>
+    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a menos de 1 m de cada uno y pulsar el punto en el mapa para explotar el globo (10 disparos para toda la carrera).</span>
   </button>
   <button id="btnCsv">Descargar último recorrido (CSV)</button>
 
@@ -390,6 +391,9 @@ class Odometer {
 }
 
 // Globos: color de cada uno (r,g,b) y radio (m). Son pequeños y se desplazan alrededor de su punto.
+const SHOT_RANGE = 1;   // m: distancia máxima al punto para poder disparar
+const SHOTS = 10;      // disparos en toda la carrera
+const CLEAR_R = 0.5;   // m: hueco libre exigido alrededor de cada punto al colocarlo en lo escaneado
 const BALLOON_RGB = ['255,90,95', '255,180,84', '61,220,151', '74,168,255', '199,125,255'];
 const BALLOON_R = 0.06;
 const BALLOON_SWAY = 0.25;
@@ -405,24 +409,27 @@ function pointInEllipse(px, py, e, slack = 0) {
 
 /*
  * Carrera de puntos: n puntos aleatorios en coordenadas del mapa (r = derecha, f = adelante
- * respecto al inicio), encadenados a 1,5–3 m unos de otros y dentro de un cuadrado de ±limit m.
- * Hay que acercarse a cada uno (a menos de `radius` m) y pulsarlo, en orden; el siguiente aparece al capturar el actual.
+ * respecto al inicio), encadenados a max(1,5; 2·radius)–(+1,5) m unos de otros (sin solapar sus radios) y dentro de un cuadrado de ±limit m.
+ * Hay que acercarse a cada uno (a menos de `radius` m) y dispararle, en orden; el siguiente aparece al explotar el actual.
+ * Solo hay `shots` disparos en toda la carrera: cada disparo a su alcance gasta uno, acierte o falle; sin disparos la carrera termina (failed).
  */
 class Course {
   constructor(n = 5, opts = {}) {
     const rnd = opts.rng || Math.random, limit = opts.limit ?? 5;
     this.radius = opts.radius ?? 0.4;
+    this.maxShots = opts.shots ?? Infinity; this.shots = 0; this.failed = false;
+    const lo = Math.max(1.5, 2 * this.radius);   // separación mínima entre puntos consecutivos
     this.pts = [];
     let prev = { r: 0, f: 0 };
     if (opts.pts) n = 0;                       // puntos ya elegidos (por ejemplo, tras escanear el entorno)
     for (let i = 0; i < n; i++) {
       let p = null;
       for (let k = 0; k < 40 && !p; k++) {
-        const d = 1.5 + rnd() * 1.5, a = rnd() * 2 * Math.PI;
+        const d = lo + rnd() * 1.5, a = rnd() * 2 * Math.PI;
         const c = { r: prev.r + Math.sin(a) * d, f: prev.f + Math.cos(a) * d };
         if (Math.abs(c.r) <= limit && Math.abs(c.f) <= limit) p = c;
       }
-      if (!p) p = { r: prev.r - Math.sign(prev.r) * 1.5, f: prev.f };   // improbable: acercarse al centro
+      if (!p) p = { r: prev.r - Math.sign(prev.r) * lo, f: prev.f };   // improbable: acercarse al centro
       this.pts.push(p); prev = p;
     }
     if (opts.pts) this.pts = opts.pts.map(p => ({ r: p.r, f: p.f }));
@@ -435,13 +442,22 @@ class Course {
     const t = this.target;
     return !!t && Math.hypot(t.r - cur.r, t.f - cur.f) <= this.radius;
   }
-  // Captura el punto actual si se está a su alcance (el jugador lo pulsa); devuelve true si lo capturó
-  capture(cur, now) {
-    if (!this.inRange(cur)) return false;
-    this.idx++;
-    if (this.idx >= this.pts.length) { this.done = true; this.tEnd = now; }
-    return true;
+  get shotsLeft() { return this.maxShots - this.shots; }
+  // Un disparo (`hit`: ¿ha dado en el globo?). Solo cuenta si se está a su alcance: si no, 'far' y no se gasta disparo.
+  // Devuelve null (carrera ya terminada) | 'far' | 'hit' | 'miss'. Al gastar el último disparo sin completar, la carrera termina (failed).
+  shoot(cur, now, hit) {
+    if (this.done) return null;
+    if (!this.inRange(cur)) return 'far';
+    this.shots++;
+    if (hit) {
+      this.idx++;
+      if (this.idx >= this.pts.length) { this.done = true; this.tEnd = now; }
+    }
+    if (!this.done && this.shots >= this.maxShots) { this.done = true; this.failed = true; this.tEnd = now; }
+    return hit ? 'hit' : 'miss';
   }
+  // Captura el punto actual si se está a su alcance (disparo certero); devuelve true si lo capturó
+  capture(cur, now) { return this.shoot(cur, now, true) === 'hit'; }
   elapsed(now) { return ((this.done ? this.tEnd : now) - this.t0) / 1000; }
   // Distancia al punto actual y giro necesario (grados, + = a la derecha) dado el giro relativo del robot
   guide(cur, relDeg) {
@@ -639,7 +655,7 @@ class Course {
     if ((mode === 'sim' || mode === 'xr') && odo.started) {
       // En AR real el espacio es menor (±4 m) y la posición tiene más ruido (radio de 0,5 m)
       if (!course) { course = makeCourse(); course.start(now); }
-      // Los puntos ya no se capturan solos: hay que estar a menos de `radius` m y pulsarlos (tryCapture)
+      // Los puntos no se capturan solos: hay que estar a menos de `radius` m y disparar (fire)
       const inR = course.inRange(odo.s.cur);
       if (inR && !wasInRange && navigator.vibrate) navigator.vibrate(25);   // aviso táctil al entrar en el radio
       wasInRange = inR;
@@ -722,9 +738,9 @@ class Course {
   // Carrera: con un escaneo, los puntos solo salen en sitios libres y alcanzables (nunca fuera de lo escaneado).
   // Si hay menos de 5 sitios, la carrera es más corta; solo sin ningún sitio libre se usan puntos aleatorios (con aviso).
   function makeCourse() {
-    const opts = { radius: 0.5, limit: mode === 'xr' ? 4 : 5 };   // capturar: a menos de 0,5 m (también en el simulador)
+    const opts = { radius: SHOT_RANGE, shots: SHOTS, limit: mode === 'xr' ? 4 : 5 };   // disparar: a menos de 1 m y solo 10 disparos (también en el simulador)
     if (mode === 'xr' && scan.grid && (scan.state === 'done' || scan.state === 'poor')) {
-      const p0 = odo.s.p0, w = scan.grid.pickPoints(5, { x: p0.x, z: p0.z }, Math.random, opts.radius);
+      const p0 = odo.s.p0, w = scan.grid.pickPoints(5, { x: p0.x, z: p0.z }, Math.random, CLEAR_R, 0.25, [[2, 3.5], [1.5, 4.5], [1.0, 6]]);
       if (w.length) {
         const c = new Course(w.length, Object.assign({}, opts, { pts: w.map(q => odo.worldToMap(q.x, q.z)) }));
         if (w.length < 5) c.note = '⚠ solo ' + w.length + ' sitio' + (w.length > 1 ? 's' : '') + ' libre' + (w.length > 1 ? 's' : '') + ' en lo escaneado';
@@ -757,54 +773,52 @@ class Course {
     }
     g.style.display = 'block';
     if (course.done) {
-      g.className = 'done';
-      g.textContent = '¡Completado en ' + course.elapsed(now).toFixed(1) + ' s! · recorrido ' + odo.s.dist.toFixed(1) + ' m · «Reiniciar inicio» = otra carrera';
+      g.className = course.failed ? 'over' : 'done';
+      g.textContent = course.failed
+        ? '¡Sin disparos! Globos explotados ' + course.idx + '/' + course.pts.length + ' · «Reiniciar inicio» = otra carrera'
+        : '¡Completado en ' + course.elapsed(now).toFixed(1) + ' s con ' + disparos(course.shots) + '! · recorrido ' + odo.s.dist.toFixed(1) + ' m · «Reiniciar inicio» = otra carrera';
       return;
     }
     const gd = course.guide(odo.s.cur, odo.s.rel), inR = course.inRange(odo.s.cur);
     g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
-      + (inR ? '¡Apunta con la mira y toca el globo!' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+      + (inR ? '¡Apunta con la mira y toca el globo!' : turn) + ' · 🎯 ' + disparos(course.shotsLeft) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
   }
 
-  // ---------- Capturar un punto: a menos de 0,5 m y acertando con el toque sobre el globo ----------
-  // Captura el punto actual: el globo explota
-  function capturePoint(now) {
-    const t = course.target, idx = course.idx, w = odo.mapToWorld(t.r, t.f);
-    if (!course.capture(odo.s.cur, now)) return false;
-    const bp = balloonPos(w, floorY(), idx, now);
-    flash = { w, t: now, R: course.radius };
-    const frags = [];
-    for (let k = 0; k < 16; k++) {                    // trozos de globo que salen despedidos y caen
-      const a = Math.random() * 2 * Math.PI, e = (Math.random() - 0.3) * 1.2, v = 0.5 + Math.random() * 0.7;
-      frags.push({ vx: Math.cos(a) * Math.cos(e) * v, vy: Math.sin(e) * v + 0.3, vz: Math.sin(a) * Math.cos(e) * v, s: 0.008 + Math.random() * 0.012 });
-    }
-    pops.push({ x: bp.x, y: bp.y, z: bp.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
-    if (navigator.vibrate) navigator.vibrate(course.done ? [60, 40, 60] : 60);
-    if (!course.done) showNote('¡Pop! Globo ' + (idx + 1) + ' ✓');
-    return true;
-  }
-
-  // Toque que ha dado en el globo (o en el círculo del mapa): hay que estar a menos de `radius` m del punto
-  function tryCapture() {
+  // ---------- Disparar: a menos de 1 m del punto, solo 10 disparos y hay que acertar el globo ----------
+  const disparos = n => n + (n === 1 ? ' disparo' : ' disparos');
+  // Un disparo (`hit`: ¿ha dado en el globo?; (tx, ty): dónde se tocó, para marcar el fallo).
+  // Lejos del punto (> 1 m) no se dispara ni se gasta munición; a su alcance cada disparo gasta uno, acierte o falle.
+  function fire(hit, tx, ty) {
     if (!course || course.done || !odo.started) return;
-    const t = course.target, cur = odo.s.cur;
-    if (!course.inRange(cur)) {
+    const now = performance.now(), cur = odo.s.cur, t = course.target, idx = course.idx, w = odo.mapToWorld(t.r, t.f);
+    const res = course.shoot(cur, now, hit);
+    if (res === 'far') {
       const d = Math.hypot(t.r - cur.r, t.f - cur.f);
-      showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para explotarlo');
+      showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para disparar');
       return;
     }
-    capturePoint(performance.now());
+    if (res === 'hit') {
+      const bp = balloonPos(w, floorY(), idx, now);
+      flash = { w, t: now, R: course.radius };
+      const frags = [];
+      for (let k = 0; k < 16; k++) {                    // trozos de globo que salen despedidos y caen
+        const a = Math.random() * 2 * Math.PI, e = (Math.random() - 0.3) * 1.2, v = 0.5 + Math.random() * 0.7;
+        frags.push({ vx: Math.cos(a) * Math.cos(e) * v, vy: Math.sin(e) * v + 0.3, vz: Math.sin(a) * Math.cos(e) * v, s: 0.008 + Math.random() * 0.012 });
+      }
+      pops.push({ x: bp.x, y: bp.y, z: bp.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
+    } else misses.push({ x: tx ?? arC.clientWidth / 2, y: ty ?? arC.clientHeight / 2, t: now });
+    if (navigator.vibrate) navigator.vibrate(course.failed ? [80, 40, 80, 40, 80] : course.done ? [60, 40, 60] : res === 'hit' ? 60 : 15);
+    if (course.failed) showNote('¡Sin disparos! Globos explotados: ' + course.idx + '/' + course.pts.length, 5000);
+    else if (!course.done) showNote(res === 'hit' ? '¡Pop! Globo ' + (idx + 1) + ' ✓ · quedan ' + disparos(course.shotsLeft)
+                                                  : '¡Fallaste! Quedan ' + disparos(course.shotsLeft) + ' · pon la mira sobre el globo y toca', 1500);
   }
 
   // Disparo en la vista de cámara: acierta si el toque cae sobre el globo, o si se toca en cualquier sitio con la mira (centro) sobre él
   function shootAR(tx, ty) {
     const ball = hitAR && hitAR.ball, W = arC.clientWidth, H = arC.clientHeight;
-    if (ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4))) { tryCapture(); return; }
-    misses.push({ x: tx, y: ty, t: performance.now() });
-    if (navigator.vibrate) navigator.vibrate(15);
-    showNote('¡Fallaste! Pon la mira sobre el globo y toca', 1200);
+    fire(!!ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4)), tx, ty);
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -1094,7 +1108,7 @@ class Course {
     if (cpts.length) {
       const now = performance.now();
       cpts.forEach((q, i) => {
-        const hecho = course.done || i < course.idx, actual = !course.done && i === course.idx;
+        const hecho = (course.done && !course.failed) || i < course.idx, actual = !course.done && i === course.idx;
         ctx.lineWidth = 2 / scale;
         ctx.strokeStyle = hecho ? 'rgba(61,220,151,.45)' : actual ? (listo ? '#3ddc97' : '#ffb454') : 'rgba(255,255,255,.35)';
         ctx.fillStyle = hecho ? 'rgba(61,220,151,.12)' : actual ? (listo ? 'rgba(61,220,151,.32)' : 'rgba(255,180,84,.18)') : 'rgba(255,255,255,.05)';
@@ -1175,7 +1189,7 @@ class Course {
     if (e.target && e.target.closest && e.target.closest('button')) return;
     const mb = mapC.getBoundingClientRect(), ab = arC.getBoundingClientRect();
     const inMap = e.clientX >= mb.left && e.clientX <= mb.right && e.clientY >= mb.top && e.clientY <= mb.bottom;
-    if (inMap) { if (hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r) tryCapture(); }
+    if (inMap) { if (hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r) fire(true); }
     else if (mode === 'xr') shootAR(e.clientX - ab.left, e.clientY - ab.top);
   });
   $('btnXR').addEventListener('click', startXR);
