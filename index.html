@@ -717,14 +717,19 @@ class Course {
     }
   }
 
-  // Carrera: con un escaneo válido, puntos en sitios libres y alcanzables; si no, aleatorios
+  // Carrera: con un escaneo, los puntos solo salen en sitios libres y alcanzables (nunca fuera de lo escaneado).
+  // Si hay menos de 5 sitios, la carrera es más corta; solo sin ningún sitio libre se usan puntos aleatorios (con aviso).
   function makeCourse() {
     const opts = { radius: 0.5, limit: mode === 'xr' ? 4 : 5 };   // capturar: a menos de 0,5 m (también en el simulador)
-    if (mode === 'xr' && scan.state === 'done' && scan.grid) {
+    if (mode === 'xr' && scan.grid && (scan.state === 'done' || scan.state === 'poor')) {
       const p0 = odo.s.p0, w = scan.grid.pickPoints(5, { x: p0.x, z: p0.z }, Math.random, opts.radius);
-      if (w.length >= 3) return new Course(5, Object.assign({}, opts, { pts: w.map(q => odo.worldToMap(q.x, q.z)) }));
+      if (w.length) {
+        const c = new Course(w.length, Object.assign({}, opts, { pts: w.map(q => odo.worldToMap(q.x, q.z)) }));
+        if (w.length < 5) c.note = '⚠ solo ' + w.length + ' sitio' + (w.length > 1 ? 's' : '') + ' libre' + (w.length > 1 ? 's' : '') + ' en lo escaneado';
+        return c;
+      }
       const c = new Course(5, opts);
-      c.note = '⚠ sin sitios libres cerca del inicio: aleatorios';
+      c.note = '⚠ sin sitios libres cerca del inicio: puntos aleatorios';
       return c;
     }
     return new Course(5, opts);
@@ -1116,7 +1121,7 @@ class Course {
   $('btnGyro').addEventListener('click', startGyro);
   $('btnSim').addEventListener('click', startSim);
   $('btnCsv').addEventListener('click', downloadCsv);
-  $('btnStart').addEventListener('click', () => { odo.arm(); course = null; resetHud(); });
+  $('btnStart').addEventListener('click', () => { if (scan.state === 'scanning') finishScan(); odo.arm(); course = null; resetHud(); });
   $('btnMap').addEventListener('click', () => {
     mapMode = mapMode === 'start' ? 'head' : 'start';
     $('btnMap').textContent = mapMode === 'start' ? 'Mapa: inicio ↑' : 'Mapa: rumbo ↑';
