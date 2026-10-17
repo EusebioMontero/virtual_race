@@ -98,7 +98,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: acércate a menos de 0,5 m y pulsa el punto para capturarlo. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos flotando: acércate y revienta cada uno con la mano (la profundidad detecta tu mano y dibuja una aguja), con un empujón del móvil o pulsándolo. Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -106,7 +106,7 @@
   </button>
   <button id="btnSim" class="mode">
     <b>Simulador</b>
-    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a menos de 0,5 m de cada uno y pulsar el punto en el mapa para capturarlo.</span>
+    <span>Un robot virtual que mueves con botones o flechas del teclado. Al marcar el inicio salen 5 puntos aleatorios y tienes que llevarlo a menos de 0,5 m de cada uno y pulsar el punto en el mapa para explotar el globo.</span>
   </button>
   <button id="btnCsv">Descargar último recorrido (CSV)</button>
 
@@ -406,6 +406,49 @@ function pointInPolygon(px, py, poly) {
   return inside;
 }
 
+// Globos: color de cada uno (r,g,b), altura de flotación sobre el suelo y balanceo suave
+const BALLOON_RGB = ['255,90,95', '255,180,84', '61,220,151', '74,168,255', '199,125,255'];
+const BALLOON_H = 1.1;
+const balloonY = (floorY, i, nowMs) => floorY + BALLOON_H + 0.07 * Math.sin(nowMs / 650 + i * 1.7);
+
+/*
+ * "Mano" a partir de la profundidad: muestras {nx, ny, d, x, y, z} de lo que hay MUY cerca de la cámara
+ * (y por encima del suelo). Si forman un objeto de tamaño de mano (no una pared ni una mesa entera) se
+ * devuelve su punta = lo más alto en la pantalla (dedos hacia arriba), media de las muestras de esa franja.
+ */
+function detectHand(samples, opts = {}) {
+  const minCount = opts.minCount ?? 6, maxExtent = opts.maxExtent ?? 0.7;
+  if (!samples || samples.length < minCount) return null;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity, top = Infinity;
+  for (const q of samples) {
+    x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y);
+    z0 = Math.min(z0, q.z); z1 = Math.max(z1, q.z); top = Math.min(top, q.ny);
+  }
+  const extent = Math.hypot(x1 - x0, y1 - y0, z1 - z0);
+  if (extent > maxExtent) return null;
+  const tipS = samples.filter(q => q.ny <= top + 0.06), n = tipS.length, m = k => tipS.reduce((a, q) => a + q[k], 0) / n;
+  return { tip: { nx: m('nx'), ny: m('ny'), d: m('d'), x: m('x'), y: m('y'), z: m('z') }, count: samples.length, extent };
+}
+
+/*
+ * Gesto con el móvil: "empujón" hacia un objetivo. Se alimenta con la distancia móvil→objetivo en cada
+ * fotograma; salta cuando el móvil está a <= reach m y en los últimos `win` ms se ha acercado >= approach m.
+ */
+class GrabDetector {
+  constructor(opts = {}) { this.reach = opts.reach ?? 0.35; this.approach = opts.approach ?? 0.25; this.win = opts.win ?? 400; this.h = []; }
+  reset() { this.h = []; }
+  update(d, now) {
+    this.h.push({ d, t: now });
+    while (this.h.length && now - this.h[0].t > this.win) this.h.shift();
+    if (d > this.reach) return false;
+    let far = 0;
+    for (const q of this.h) far = Math.max(far, q.d);
+    if (far - d < this.approach) return false;
+    this.h = [];                                   // el gesto se consume
+    return true;
+  }
+}
+
 /*
  * Carrera de puntos: n puntos aleatorios en coordenadas del mapa (r = derecha, f = adelante
  * respecto al inicio), encadenados a 1,5–3 m unos de otros y dentro de un cuadrado de ±limit m.
@@ -439,8 +482,8 @@ class Course {
     return !!t && Math.hypot(t.r - cur.r, t.f - cur.f) <= this.radius;
   }
   // Captura el punto actual si se está a su alcance (el jugador lo pulsa); devuelve true si lo capturó
-  capture(cur, now) {
-    if (!this.inRange(cur)) return false;
+  capture(cur, now, force = false) {
+    if (this.done || (!force && !this.inRange(cur))) return false;     // force: la mano ha tocado el globo, aunque esté algo lejos
     this.idx++;
     if (this.idx >= this.pts.length) { this.done = true; this.tEnd = now; }
     return true;
@@ -478,6 +521,11 @@ class Course {
   let hitAR = null, hitMap = null;   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
   let wasInRange = false;            // para vibrar una vez al entrar en el radio del punto
   let flash = null;                  // onda verde al capturar un punto: { w, t, R }
+  let pops = [];                     // globos explotando: { x, y, z, rgb, t, frags }
+  const hand = { last: null };       // última mano detectada con la profundidad: { tip, pts, t }
+  const grab = new GrabDetector();   // gesto de "empujón" con el móvil hacia el globo
+  let camY = null;                   // altura actual del móvil (para el suelo estimado)
+  const floorY = y => floor.y != null ? floor.y : (y ?? camY ?? 1.3) - 1.3;
 
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = err ? 'err' : ''; }
 
@@ -605,7 +653,9 @@ class Course {
     const ok = !pose.emulatedPosition;
     if (xr.hitSrc) sampleFloor(frame, pos);
     if (scan.state === 'scanning') scanStep(frame, pose, performance.now());
-    tick({ x: pos.x, z: pos.z, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
+    camY = pos.y;
+    handStep(frame, pose, performance.now());
+    tick({ x: pos.x, y: pos.y, z: pos.z, fwd: v.f, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
     drawAR(pose);
   }
 
@@ -641,6 +691,7 @@ class Course {
       const inR = course.inRange(odo.s.cur);
       if (inR && !wasInRange && navigator.vibrate) navigator.vibrate(25);   // aviso táctil al entrar en el radio
       wasInRange = inR;
+      if (mode === 'xr' && p && p.y != null && !course.done) autoCapture(p, now);
     }
     updateGame(now);
     const tr = $('track'), msg = banner || (now < noteUntil ? noteMsg : '');
@@ -763,7 +814,7 @@ class Course {
     g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
-      + (inR ? '¡Pulsa el punto!' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+      + (inR ? '¡Explótalo! Acerca la mano al globo (o púlsalo)' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
   }
 
   // ---------- Capturar un punto: a menos de 0,5 m y pulsando una parte del punto ----------
@@ -773,19 +824,68 @@ class Course {
     return !!h.ring && pointInPolygon(x, y, h.ring);                                             // anillo del suelo
   }
 
+  // Captura el punto actual: el globo explota. force = la mano (aguja) lo ha tocado, no hace falta estar a < 0,5 m
+  function capturePoint(now, force) {
+    const t = course.target, idx = course.idx, w = odo.mapToWorld(t.r, t.f);
+    if (!course.capture(odo.s.cur, now, force)) return false;
+    const by = balloonY(floorY(), idx, now);
+    flash = { w, t: now, R: course.radius };
+    const frags = [];
+    for (let k = 0; k < 16; k++) {                    // trozos de globo que salen despedidos y caen
+      const a = Math.random() * 2 * Math.PI, e = (Math.random() - 0.3) * 1.2, v = 0.5 + Math.random() * 0.7;
+      frags.push({ vx: Math.cos(a) * Math.cos(e) * v, vy: Math.sin(e) * v + 0.3, vz: Math.sin(a) * Math.cos(e) * v, s: 0.008 + Math.random() * 0.012 });
+    }
+    pops.push({ x: w.x, y: by, z: w.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
+    if (navigator.vibrate) navigator.vibrate(course.done ? [60, 40, 60] : 60);
+    if (!course.done) showNote('¡Pop! Globo ' + (idx + 1) + ' ✓');
+    return true;
+  }
+
+  // Pulsar el globo en pantalla (alternativa a la mano): hay que estar a menos de `radius` m
   function tryCapture() {
     if (!course || course.done || !odo.started) return;
-    const t = course.target, cur = odo.s.cur, now = performance.now(), idx = course.idx;
+    const t = course.target, cur = odo.s.cur;
     if (!course.inRange(cur)) {
       const d = Math.hypot(t.r - cur.r, t.f - cur.f);
-      showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para capturarlo');
+      showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para explotarlo');
       return;
     }
-    const w = odo.mapToWorld(t.r, t.f);
-    course.capture(cur, now);
-    flash = { w, t: now, R: course.radius };
-    if (navigator.vibrate) navigator.vibrate(course.done ? [60, 40, 60] : 60);
-    if (!course.done) showNote('Punto ' + (idx + 1) + ' capturado ✓');
+    capturePoint(performance.now(), false);
+  }
+
+  // Mano con aguja o gesto del móvil que revientan el globo actual (solo AR)
+  function autoCapture(p, now) {
+    if (grab.owner !== course || grab.idx !== course.idx) { grab.reset(); grab.owner = course; grab.idx = course.idx; }
+    const t = course.target, w = odo.mapToWorld(t.r, t.f), by = balloonY(floorY(p.y), course.idx, now);
+    const d = Math.hypot(p.x - w.x, p.y - by, p.z - w.z);
+    const h = hand.last;
+    // 1) la punta de la aguja (en la mano detectada) toca el globo
+    if (h && now - h.t < 200 && d <= 1.2 && Math.hypot(h.tip.x - w.x, h.tip.y - by, h.tip.z - w.z) <= 0.22) { capturePoint(now, true); return; }
+    // 2) empujón del móvil hacia el globo, mirándolo, estando muy cerca
+    let face = 1;
+    if (p.fwd && d > 1e-6) face = (p.fwd.x * (w.x - p.x) + p.fwd.y * (by - p.y) + p.fwd.z * (w.z - p.z)) / d;
+    if (grab.update(d, now) && face >= 0.6) capturePoint(now, false);
+  }
+
+  // Busca la mano con la profundidad: lo que hay a 0,25–0,9 m de la cámara, por encima del suelo y del tamaño de una mano
+  function handStep(frame, pose, now) {
+    if (!xr || !xr.depthOk || !course || course.done || !odo.started) return;
+    const pos = pose.transform.position, t = course.target, w = odo.mapToWorld(t.r, t.f), fy = floorY(pos.y);
+    if (Math.hypot(pos.x - w.x, pos.y - balloonY(fy, course.idx, now), pos.z - w.z) > 1.6) return;   // solo cerca del globo
+    const view = pose.views[0];
+    let di = null;
+    try { di = frame.getDepthInformation(view); } catch (e) { di = null; }
+    if (!di) return;
+    const P = view.projectionMatrix, M = view.transform.matrix, S = [];
+    for (let ny = 0.06; ny < 0.97; ny += 0.05) for (let nx = 0.06; nx < 0.95; nx += 0.04) {
+      const d = di.getDepthInMeters(nx, ny);
+      if (!(d > 0.25 && d < 0.9)) continue;
+      const q = depthToWorld(P, M, nx, ny, d);
+      if (q.y - fy < 0.15) continue;                                  // el suelo no es una mano
+      S.push({ nx, ny, d, x: q.x, y: q.y, z: q.z });
+    }
+    const res = detectHand(S);
+    if (res) hand.last = { tip: res.tip, pts: S, t: now };
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -833,6 +933,25 @@ class Course {
     const toV = (x, y, z) => mulMat4Point(V, x, y, z);
     const on = (p, m) => !!p && p.x > -m && p.x < W + m && p.y > -m && p.y < H + m;
     actx.lineJoin = 'round'; actx.lineCap = 'round';
+
+    // Globo: nudo, cuerpo con degradado y brillo, y el número; `glow` = a su alcance (aro verde)
+    const drawBalloon = (cx, cy, rx, ry, rgb, alpha, label, glow) => {
+      actx.save(); actx.globalAlpha = alpha;
+      actx.fillStyle = 'rgb(' + rgb + ')'; actx.beginPath();
+      actx.moveTo(cx, cy + ry - 1); actx.lineTo(cx - rx * 0.13, cy + ry + rx * 0.2); actx.lineTo(cx + rx * 0.13, cy + ry + rx * 0.2); actx.closePath(); actx.fill();
+      let fill = 'rgba(' + rgb + ',.92)';
+      const gr = actx.createRadialGradient ? actx.createRadialGradient(cx - rx * 0.35, cy - ry * 0.4, rx * 0.08, cx, cy, Math.max(rx, ry) * 1.15) : null;
+      if (gr && gr.addColorStop) {
+        gr.addColorStop(0, 'rgba(255,255,255,.95)'); gr.addColorStop(0.2, 'rgba(' + rgb + ',.95)'); gr.addColorStop(1, 'rgba(' + rgb + ',.78)'); fill = gr;
+      }
+      actx.fillStyle = fill; actx.beginPath(); actx.ellipse(cx, cy, rx, ry, 0, 0, 7); actx.fill();
+      actx.fillStyle = 'rgba(255,255,255,.35)'; actx.beginPath(); actx.ellipse(cx - rx * 0.38, cy - ry * 0.48, rx * 0.15, ry * 0.25, -0.5, 0, 7); actx.fill();
+      if (glow) { actx.strokeStyle = 'rgba(61,220,151,.95)'; actx.lineWidth = 4; actx.beginPath(); actx.ellipse(cx, cy, rx * 1.14, ry * 1.12, 0, 0, 7); actx.stroke(); }
+      actx.font = '800 ' + Math.max(12, Math.round(rx * 0.9)) + 'px system-ui,sans-serif'; actx.textAlign = 'center'; actx.textBaseline = 'middle';
+      actx.lineWidth = 3; actx.strokeStyle = 'rgba(0,0,0,.35)'; actx.strokeText(label, cx, cy + 1);
+      actx.fillStyle = '#fff'; actx.fillText(label, cx, cy + 1);
+      actx.restore();
+    };
 
     // Traza una polilínea 3D (en espacio de vista) recortando lo que queda detrás de la cámara
     const strokeView = (pts, style, lw) => {
@@ -910,33 +1029,23 @@ class Course {
         strokeView(ringAt(t.w, R * (1 + k * 0.8)), 'rgba(' + col + ',' + (1 - k) * 0.8 + ')', 3);
       }
 
-      // Poste vertical con el número arriba
-      const base = toV(t.w.x, fy, t.w.z), top = toV(t.w.x, fy + 1.6, t.w.z);
-      strokeView([base, top], 'rgba(' + col + ',' + 0.85 * al + ')', ready ? 5 : actual ? 3 : 2);
-      const tp = projectView(P, top, W, H), bp = projectView(P, base, W, H);
-      let pa = null, pb = null;                                          // tramo visible del poste (delante de la cámara)
-      if (hit) {
-        const seg = clipSegmentView(base, top);
-        if (seg) { pa = projectView(P, seg[0], W, H); pb = projectView(P, seg[1], W, H); }
-        if (pa && pb) hit.pole = [pa, pb];
+      // Globo flotando sobre el anillo, atado al suelo con un hilo
+      const bY = balloonY(fy, t.i, now), rgb = BALLOON_RGB[t.i % 5];
+      const baseV = toV(t.w.x, fy, t.w.z), knotV = toV(t.w.x, bY - 0.2, t.w.z), c = projectView(P, toV(t.w.x, bY, t.w.z), W, H);
+      strokeView([baseV, knotV], 'rgba(255,255,255,' + 0.75 * al + ')', 1.5);
+      if (hit) {                                                         // el hilo también es zona pulsable
+        const seg = clipSegmentView(baseV, knotV);
+        if (seg) { const pa = projectView(P, seg[0], W, H), pb = projectView(P, seg[1], W, H); if (pa && pb) hit.pole = [pa, pb]; }
       }
-      let mp = on(tp, 30) ? tp : (on(bp, 30) ? bp : null);              // marcador arriba, o en la base si el poste se sale
-      if (!mp && pa && pb) {                                             // de cerca: en el trozo del poste que sí se ve
-        for (let k = 1; k < 10 && !mp; k++) {
-          const q = { x: pa.x + (pb.x - pa.x) * k / 10, y: pa.y + (pb.y - pa.y) * k / 10, depth: pa.depth + (pb.depth - pa.depth) * k / 10 };
-          if (on(q, 30)) mp = q;
-        }
-      }
-      if (mp) {
-        let rpx = Math.max(actual ? 16 : 11, 0.2 * fpx / mp.depth);
-        if (ready) rpx *= 1 + 0.15 * Math.sin(now / 110);               // late cuando se puede pulsar
-        if (hit) hit.marker = { x: mp.x, y: mp.y, r: Math.max(rpx, 22) + 14 };
-        actx.fillStyle = 'rgba(' + col + ',' + (actual ? 0.95 : 0.6) + ')'; actx.beginPath(); actx.arc(mp.x, mp.y, rpx, 0, 7); actx.fill();
-        actx.fillStyle = ready ? '#06281a' : '#2b1a00'; actx.font = '700 ' + Math.round(rpx * 1.1) + 'px system-ui,sans-serif';
-        actx.textAlign = 'center'; actx.textBaseline = 'middle'; actx.fillText(String(t.i + 1), mp.x, mp.y + 1);
+      const rx = c ? 0.17 * fpx / c.depth : 0, ry = rx * 1.2;
+      if (c && on(c, Math.max(rx, ry) * 0.5 + 20)) {
+        const pulse = ready ? 1 + 0.06 * Math.sin(now / 110) : 1;
+        drawBalloon(c.x, c.y, rx * pulse, ry * pulse, rgb, actual ? 1 : 0.55, String(t.i + 1), ready);
+        if (hit) hit.marker = { x: c.x, y: c.y, r: Math.max(Math.max(rx, ry) * 1.1, 28) + 8 };
         if (actual) {
           actx.fillStyle = ready ? '#3ddc97' : '#fff'; actx.font = '700 14px system-ui,sans-serif';
-          actx.fillText(ready ? '¡PULSA!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', mp.x, mp.y + rpx + 14);
+          actx.textAlign = 'center'; actx.textBaseline = 'middle';
+          actx.fillText(ready ? '¡EXPLÓTALO!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', c.x, c.y + ry + rx * 0.2 + 18);
         }
       } else if (actual) {                                               // fuera de pantalla: aviso en el borde
         const g = course.guide(odo.s.cur, odo.s.rel), right = g.turn > 0;
@@ -948,6 +1057,41 @@ class Course {
         actx.fill();
         actx.fillStyle = '#ffb454'; actx.textAlign = 'left'; actx.textBaseline = 'middle'; actx.fillText(txt, bx + 10, by + 15);
       }
+    }
+
+    // Globos reventando: destello, trozos que caen y «¡POP!»
+    pops = pops.filter(q => now - q.t < 900);
+    for (const q of pops) {
+      const age = (now - q.t) / 1000, k = age / 0.9, c0 = projectView(P, toV(q.x, q.y, q.z), W, H);
+      if (c0 && age < 0.25) {
+        actx.strokeStyle = 'rgba(255,255,255,' + (1 - age / 0.25) * 0.9 + ')'; actx.lineWidth = 5; actx.beginPath();
+        actx.arc(c0.x, c0.y, (0.17 + age * 1.6) * fpx / c0.depth, 0, 7); actx.stroke();
+      }
+      for (const f of q.frags) {
+        const fp = projectView(P, toV(q.x + f.vx * age, q.y + f.vy * age - 1.1 * age * age, q.z + f.vz * age), W, H);
+        if (!fp) continue;
+        actx.fillStyle = 'rgba(' + q.rgb + ',' + (1 - k) + ')'; actx.beginPath();
+        actx.arc(fp.x, fp.y, Math.min(12, Math.max(2, f.s * fpx / fp.depth * (1 - k * 0.6))), 0, 7); actx.fill();
+      }
+      if (c0) {
+        actx.fillStyle = 'rgba(255,255,255,' + (1 - k) + ')'; actx.strokeStyle = 'rgba(0,0,0,' + 0.4 * (1 - k) + ')'; actx.lineWidth = 4;
+        actx.font = '800 ' + Math.round(26 + 14 * k) + 'px system-ui,sans-serif'; actx.textAlign = 'center'; actx.textBaseline = 'middle';
+        actx.strokeText('¡POP!', c0.x, c0.y - age * 70); actx.fillText('¡POP!', c0.x, c0.y - age * 70);
+      }
+    }
+
+    // Mano detectada con la profundidad: puntos de la mano y una aguja en la punta
+    const hl = hand.last;
+    if (hl && now - hl.t < 150) {
+      actx.fillStyle = 'rgba(80,200,255,.3)';
+      for (const q of hl.pts) { actx.beginPath(); actx.arc(q.nx * W, q.ny * H, 5, 0, 7); actx.fill(); }
+      const tx = hl.tip.nx * W, ty = hl.tip.ny * H, L = Math.max(46, 0.16 * fpx / hl.tip.d), ux = 0.3, uy = -0.954;   // aguja inclinada hacia arriba
+      const ax = tx - ux * L, ay = ty - uy * L, lw = Math.max(2.5, L * 0.045);
+      actx.strokeStyle = 'rgba(0,0,0,.45)'; actx.lineWidth = lw + 2.5; actx.beginPath(); actx.moveTo(ax, ay); actx.lineTo(tx, ty); actx.stroke();
+      actx.strokeStyle = '#e4eaf1'; actx.lineWidth = lw; actx.beginPath(); actx.moveTo(ax, ay); actx.lineTo(tx, ty); actx.stroke();
+      actx.strokeStyle = '#e4eaf1'; actx.lineWidth = Math.max(1.5, lw * 0.6); actx.beginPath();            // ojo de la aguja
+      actx.ellipse(ax - ux * lw * 1.6, ay - uy * lw * 1.6, lw * 0.9, lw * 2, 0.3, 0, 7); actx.stroke();
+      actx.fillStyle = '#fff'; actx.beginPath(); actx.arc(tx, ty, lw * 1.1, 0, 7); actx.fill();            // brillo en la punta
     }
     actx.textAlign = 'start'; actx.textBaseline = 'alphabetic';
   }
@@ -1145,7 +1289,7 @@ class Course {
   addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
   addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
 
-  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, get course() { return course; }, floor, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
+  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, get course() { return course; }, floor, hand, get pops() { return pops; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
   checkSupport();
 })();
 </script>
