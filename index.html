@@ -78,7 +78,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Al marcar el inicio salen 5 puntos aleatorios que recorres andando (necesitas unos 8 × 8 m libres). Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -407,8 +407,9 @@ class Course {
   function tick(p, banner) {
     odo.update(p);
     const now = performance.now();
-    if (mode === 'sim' && odo.started) {
-      if (!course) { course = new Course(5); course.start(now); }
+    if ((mode === 'sim' || mode === 'xr') && odo.started) {
+      // En AR real el espacio es menor (±4 m) y la posición tiene más ruido (radio de 0,5 m)
+      if (!course) { course = new Course(5, mode === 'xr' ? { radius: 0.5, limit: 4 } : {}); course.start(now); }
       else if (course.update(odo.s.cur, now) && navigator.vibrate) navigator.vibrate(60);
     }
     updateGame(now);
