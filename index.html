@@ -37,6 +37,20 @@
   #simtag { display:none; position:absolute; left:50%; top:38%; transform:translate(-50%,-50%); font-size:.85rem; letter-spacing:.2em; color:rgba(255,255,255,.28); }
   #app.sim #simtag { display:block; }
 
+  /* Capa donde se dibujan los puntos sobre la imagen de la cámara (solo AR) */
+  #ar { display:none; position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #app.xr #ar { display:block; }
+  #floorinfo { display:none; position:absolute; left:10px; bottom:calc(max(10px, env(safe-area-inset-bottom)) + 62px); font-size:.7rem; font-weight:600; padding:3px 9px; border-radius:12px; background:rgba(255,180,84,.92); color:#2b1a00; }
+  #floorinfo.ok { background:rgba(61,220,151,.92); color:#06281a; }
+  #app.xr #floorinfo { display:block; }
+  #app.xr:not(.arview) #floorinfo { bottom:calc(44% + 8px); }
+  #btnView { display:none; flex:1; }
+  #app.xr #btnView { display:block; }
+  /* Vista AR: el panel se vuelve transparente y el mapa pasa a ser un minimapa en la esquina */
+  #app.arview #panel { height:auto; background:transparent; pointer-events:none; }
+  #app.arview #mapwrap { position:absolute; right:10px; bottom:calc(max(10px, env(safe-area-inset-bottom)) + 62px); width:min(38vw, 38vh); height:min(38vw, 38vh); flex:none; border:1px solid rgba(255,255,255,.25); opacity:.92; pointer-events:none; }
+  #app.arview #btns { pointer-events:auto; background:rgba(10,14,18,.72); padding:8px; border-radius:14px; }
+
   #hud { position:absolute; top:0; left:0; right:0; padding:max(10px, env(safe-area-inset-top)) 10px 0; display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
   .chip { background:rgba(10,14,18,.66); border-radius:12px; padding:6px 6px 5px; text-align:center; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); min-width:0; }
   .chip small { display:block; font-size:.6rem; letter-spacing:.05em; text-transform:uppercase; color:#b6c3cf; }
@@ -66,6 +80,9 @@
     #game { right:46%; }
     #track { left:27%; }
     #simctl { bottom:10px; }
+    #app.arview #panel { left:0; right:0; width:auto; height:auto; }
+    #app.arview #hud, #app.arview #game { right:10px; }
+    #app.xr:not(.arview) #floorinfo { bottom:10px; left:10px; }
   }
 </style>
 </head>
@@ -78,7 +95,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Al marcar el inicio salen 5 puntos aleatorios que recorres andando (necesitas unos 8 × 8 m libres). Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Al marcar el inicio salen 5 puntos aleatorios que ves sobre la cámara, en el suelo, y recorres andando (unos 8 × 8 m libres). Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -101,6 +118,8 @@
 <div id="app">
   <video id="cam" playsinline muted autoplay></video>
   <div id="simtag">SIMULADOR</div>
+  <canvas id="ar"></canvas>
+  <div id="floorinfo"></div>
   <div id="hud">
     <div class="chip"><small>Giro</small><b id="vRot">—</b><em id="sRot">&nbsp;</em></div>
     <div class="chip"><small>Recorrido</small><b id="vDist">—</b><em id="sDist">&nbsp;</em></div>
@@ -118,6 +137,7 @@
     <div id="btns">
       <button id="btnStart">Marcar inicio</button>
       <button id="btnMap">Mapa: inicio ↑</button>
+      <button id="btnView">Vista: AR</button>
       <button id="btnExit">Salir</button>
     </div>
   </div>
@@ -168,6 +188,40 @@ function eulerVectors(aDeg, bDeg, gDeg) {
   };
 }
 
+/* ---- Proyección de puntos del mundo a la pantalla (para dibujar sobre la cámara) ---- */
+const NEAR = 0.05;   // m: por delante de este plano se dibuja; por detrás se recorta
+
+// Multiplica una matriz 4x4 en orden de columnas (como WebXR/WebGL) por (x, y, z, 1)
+function mulMat4Point(m, x, y, z) {
+  return [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13],
+          m[2] * x + m[6] * y + m[10] * z + m[14], m[3] * x + m[7] * y + m[11] * z + m[15]];
+}
+
+// Punto en espacio de vista (la cámara mira a -Z) -> píxeles CSS de una pantalla W×H; null si está detrás
+function projectView(P, pv, W, H) {
+  if (pv[2] > -NEAR) return null;
+  const c = mulMat4Point(P, pv[0], pv[1], pv[2]);
+  if (c[3] <= 0) return null;
+  return { x: (c[0] / c[3] * 0.5 + 0.5) * W, y: (1 - (c[1] / c[3] * 0.5 + 0.5)) * H, depth: -pv[2] };
+}
+
+// Recorta un segmento (en espacio de vista) al plano cercano; null si queda entero por detrás
+function clipSegmentView(a, b) {
+  const za = a[2] + NEAR, zb = b[2] + NEAR;               // por delante <=> z + NEAR < 0
+  if (za >= 0 && zb >= 0) return null;
+  if (za < 0 && zb < 0) return [a, b];
+  const t = za / (za - zb);
+  const p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, -NEAR - 1e-6];
+  return za < 0 ? [a, p] : [p, b];
+}
+
+// Percentil p (0..1) con interpolación lineal; null si no hay datos
+function percentile(arr, p) {
+  if (!arr.length) return null;
+  const s = arr.slice().sort((a, b) => a - b), i = (s.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i);
+  return s[lo] + (s[hi] - s[lo]) * (i - lo);
+}
+
 /*
  * Odómetro: a partir del momento de arm() + primera muestra válida toma el punto y el rumbo
  * de inicio como origen. Ejes del mapa: r = derecha, f = adelante (respecto al rumbo inicial).
@@ -177,6 +231,11 @@ class Odometer {
   constructor(opts = {}) { this.minStep = opts.minStep ?? 0.02; this.clear(); }
   clear() { this.pending = false; this.started = false; this.lost = false; this.s = null; }
   arm() { this.clear(); this.pending = true; }
+  // Convierte un punto del mapa (r derecha, f adelante del inicio) a coordenadas del mundo (x, z)
+  mapToWorld(r, f) {
+    const s = this.s, h0 = s.h0 * D2R;
+    return { x: s.p0.x + r * Math.cos(h0) + f * Math.sin(h0), z: s.p0.z + r * Math.sin(h0) - f * Math.cos(h0) };
+  }
   update(p) {
     if (!p) { if (this.started) this.lost = true; return; }
     if (this.pending && p.ok) {
@@ -265,7 +324,9 @@ class Course {
   const gyro = { a: 0, b: 0, g: 0, has: false };
   const sim = { x: 0, z: 0, h: 0, up: false, left: false, right: false };
   let lastRun = null;
-  let course = null;               // carrera de puntos (solo en el simulador)
+  let course = null;               // carrera de puntos (simulador y AR)
+  const floor = { y: null, samples: [], detected: false };   // altura del suelo en el espacio de ARCore
+  const arC = $('ar'), actx = arC.getContext('2d');
 
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = err ? 'err' : ''; }
 
@@ -286,8 +347,10 @@ class Course {
   // ---------- Arranque y parada ----------
   function openApp(m) {
     mode = m; odo.clear(); resetHud(); lastHeading = 0;
+    floor.y = null; floor.samples = []; floor.detected = false;
     mapMode = 'start'; $('btnMap').textContent = 'Mapa: inicio ↑';
-    app.className = m; app.style.display = 'block';
+    app.className = m + (m === 'xr' ? ' arview' : ''); app.style.display = 'block';   // en AR se empieza en vista AR
+    $('btnView').textContent = 'Vista: AR';
     if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wakeLock = l; }).catch(() => {});
   }
 
@@ -313,7 +376,7 @@ class Course {
     try {
       session = await navigator.xr.requestSession('immersive-ar', {
         requiredFeatures: ['local'],
-        optionalFeatures: ['dom-overlay'],
+        optionalFeatures: ['dom-overlay', 'hit-test'],
         domOverlay: { root: app }
       });
     } catch (e) { setStatus('No se pudo iniciar AR: ' + e.message, true); return; }
@@ -327,7 +390,12 @@ class Course {
       const gl = document.createElement('canvas').getContext('webgl', { xrCompatible: true, alpha: true });
       session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
       const refSpace = await session.requestReferenceSpace('local');
-      xr = { session, gl, refSpace };
+      let hitSrc = null;
+      try {   // detección del suelo (opcional): rayo desde el centro de la cámara, 30° hacia abajo
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitSrc = await session.requestHitTestSource({ space: viewerSpace, offsetRay: new XRRay({ x: 0, y: 0, z: 0 }, { x: 0, y: -0.5, z: -0.866 }) });
+      } catch (e) { hitSrc = null; }
+      xr = { session, gl, refSpace, hitSrc };
     } catch (e) {
       session.end();
       setStatus('No se pudo preparar la sesión AR: ' + e.message, true);
@@ -375,11 +443,13 @@ class Course {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     const pose = frame.getViewerPose(xr.refSpace);
-    if (!pose) { tick(null, 'Sin pose: mueve el móvil despacio'); return; }
+    if (!pose) { tick(null, 'Sin pose: mueve el móvil despacio'); drawAR(null); return; }
     const pos = pose.transform.position, v = xrVectors(pose.transform.orientation);
     lastHeading = headingFromVectors(v.f, v.u, lastHeading);
     const ok = !pose.emulatedPosition;
+    if (xr.hitSrc) sampleFloor(frame, pos);
     tick({ x: pos.x, z: pos.z, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
+    drawAR(pose);
   }
 
   function onOri(e) {
@@ -455,6 +525,131 @@ class Course {
     const gd = course.guide(odo.s.cur, odo.s.rel);
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · ' + turn + ' · ' + course.elapsed(now).toFixed(1) + ' s';
+  }
+
+  // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
+  // Altura del suelo: se toman las colisiones del rayo con superficies horizontales entre 0,6 y 2,5 m
+  // por debajo del móvil y se usa un percentil bajo (el suelo es lo más bajo; mesas y sillas quedan por encima).
+  function sampleFloor(frame, pos) {
+    let res;
+    try { res = frame.getHitTestResults(xr.hitSrc); } catch (e) { return; }
+    if (!res.length) return;
+    const hp = res[0].getPose(xr.refSpace);
+    if (!hp) return;
+    const o = hp.transform.orientation, upY = 1 - 2 * (o.x * o.x + o.z * o.z);   // la normal de la superficie es su eje Y
+    const dy = pos.y - hp.transform.position.y;
+    if (upY < 0.9 || dy < 0.6 || dy > 2.5) return;
+    floor.samples.push(hp.transform.position.y);
+    if (floor.samples.length > 60) floor.samples.shift();
+    if (floor.samples.length >= 8) {
+      const est = percentile(floor.samples, 0.25);
+      floor.y = floor.detected ? floor.y + (est - floor.y) * 0.15 : est;
+      floor.detected = true;
+    }
+  }
+
+  function setFloorInfo() {
+    const el = $('floorinfo');
+    const txt = floor.detected ? 'suelo detectado ✓' : (xr && xr.hitSrc ? 'suelo estimado · apunta al suelo para afinar' : 'suelo estimado (1,3 m bajo el móvil)');
+    if (el.textContent !== txt) { el.textContent = txt; el.className = floor.detected ? 'ok' : ''; }
+  }
+
+  function drawAR(pose) {
+    const dpr = Math.min(2, window.devicePixelRatio || 1), W = arC.clientWidth, H = arC.clientHeight;
+    if (!W || !H) return;
+    const cw = Math.round(W * dpr), ch = Math.round(H * dpr);
+    if (arC.width !== cw || arC.height !== ch) { arC.width = cw; arC.height = ch; }
+    actx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    actx.clearRect(0, 0, W, H);
+    if (!pose || !pose.views.length) return;
+    const cam = pose.transform.position;
+    if (floor.y == null) floor.y = cam.y - 1.3;         // hasta detectar el suelo se supone el móvil a 1,3 m
+    setFloorInfo();
+    if (!course || !odo.started) return;
+
+    const view = pose.views[0], P = view.projectionMatrix, V = view.transform.inverse.matrix;
+    const fy = floor.y, now = performance.now(), fpx = P[5] * H / 2;   // fpx: focal vertical en píxeles
+    const toV = (x, y, z) => mulMat4Point(V, x, y, z);
+    const on = (p, m) => !!p && p.x > -m && p.x < W + m && p.y > -m && p.y < H + m;
+    actx.lineJoin = 'round'; actx.lineCap = 'round';
+
+    // Traza una polilínea 3D (en espacio de vista) recortando lo que queda detrás de la cámara
+    const strokeView = (pts, style, lw) => {
+      actx.strokeStyle = style; actx.lineWidth = lw; actx.beginPath();
+      for (let i = 0; i < pts.length - 1; i++) {
+        const seg = clipSegmentView(pts[i], pts[i + 1]);
+        if (!seg) continue;
+        const a = projectView(P, seg[0], W, H), b = projectView(P, seg[1], W, H);
+        if (a && b) { actx.moveTo(a.x, a.y); actx.lineTo(b.x, b.y); }
+      }
+      actx.stroke();
+    };
+    const ringAt = (w, rad) => {
+      const out = [];
+      for (let k = 0; k <= 40; k++) { const an = k / 40 * 2 * Math.PI; out.push(toV(w.x + Math.sin(an) * rad, fy, w.z + Math.cos(an) * rad)); }
+      return out;
+    };
+
+    // Puntos pendientes, de más lejos a más cerca
+    const tg = [];
+    course.pts.forEach((q, i) => {
+      if (course.done || i < course.idx) return;
+      const w = odo.mapToWorld(q.r, q.f);
+      tg.push({ i, w, depth: -toV(w.x, fy, w.z)[2] });
+    });
+    tg.sort((a, b) => b.depth - a.depth);
+
+    // Guía en el suelo: trazos en perspectiva desde el móvil hasta el punto actual
+    const cur = course.target;
+    if (cur) {
+      const w = odo.mapToWorld(cur.r, cur.f), dx = w.x - cam.x, dz = w.z - cam.z, d = Math.hypot(dx, dz);
+      for (let s = 0.8; s < d - course.radius; s += 0.3) {
+        const e = Math.min(s + 0.15, d - course.radius);
+        strokeView([toV(cam.x + dx / d * s, fy, cam.z + dz / d * s), toV(cam.x + dx / d * e, fy, cam.z + dz / d * e)], 'rgba(255,180,84,.7)', 3);
+      }
+    }
+
+    for (const t of tg) {
+      const actual = !course.done && t.i === course.idx, col = actual ? '255,180,84' : '255,255,255', al = actual ? 1 : 0.45;
+      const R = course.radius;
+
+      // Anillo en el suelo (relleno translúcido si entero está delante de la cámara)
+      const ring = ringAt(t.w, R), proj = ring.map(pv => projectView(P, pv, W, H));
+      if (proj.every(Boolean)) {
+        actx.fillStyle = 'rgba(' + col + ',' + (actual ? 0.22 : 0.08) + ')'; actx.beginPath();
+        proj.forEach((p, k) => k ? actx.lineTo(p.x, p.y) : actx.moveTo(p.x, p.y)); actx.closePath(); actx.fill();
+      }
+      strokeView(ring, 'rgba(' + col + ',' + al + ')', actual ? 4 : 2);
+      if (actual) {                                                     // onda que se expande
+        const k = (now % 1200) / 1200;
+        strokeView(ringAt(t.w, R * (1 + k * 0.8)), 'rgba(255,180,84,' + (1 - k) * 0.8 + ')', 3);
+      }
+
+      // Poste vertical con el número arriba
+      strokeView([toV(t.w.x, fy, t.w.z), toV(t.w.x, fy + 1.6, t.w.z)], 'rgba(' + col + ',' + 0.85 * al + ')', actual ? 3 : 2);
+      const tp = projectView(P, toV(t.w.x, fy + 1.6, t.w.z), W, H), bp = projectView(P, toV(t.w.x, fy, t.w.z), W, H);
+      const mp = on(tp, 30) ? tp : (on(bp, 30) ? bp : null);              // marcador arriba, o en la base si el poste se sale
+      if (mp) {
+        const rpx = Math.max(11, 0.2 * fpx / mp.depth);
+        actx.fillStyle = 'rgba(' + col + ',' + (actual ? 0.95 : 0.6) + ')'; actx.beginPath(); actx.arc(mp.x, mp.y, rpx, 0, 7); actx.fill();
+        actx.fillStyle = '#2b1a00'; actx.font = '700 ' + Math.round(rpx * 1.1) + 'px system-ui,sans-serif';
+        actx.textAlign = 'center'; actx.textBaseline = 'middle'; actx.fillText(String(t.i + 1), mp.x, mp.y + 1);
+        if (actual) {
+          actx.fillStyle = '#fff'; actx.font = '700 14px system-ui,sans-serif';
+          actx.fillText(Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', mp.x, mp.y + rpx + 14);
+        }
+      } else if (actual) {                                               // fuera de pantalla: aviso en el borde
+        const g = course.guide(odo.s.cur, odo.s.rel), right = g.turn > 0;
+        const txt = (right ? '' : '◀ ') + g.dist.toFixed(1) + ' m' + (right ? ' ▶' : '');
+        actx.font = '700 15px system-ui,sans-serif';
+        const bw = actx.measureText(txt).width + 20, bx = right ? W - bw - 8 : 8, by = H * 0.3;
+        actx.fillStyle = 'rgba(10,14,18,.8)'; actx.beginPath();
+        if (actx.roundRect) actx.roundRect(bx, by, bw, 30, 15); else actx.rect(bx, by, bw, 30);
+        actx.fill();
+        actx.fillStyle = '#ffb454'; actx.textAlign = 'left'; actx.textBaseline = 'middle'; actx.fillText(txt, bx + 10, by + 15);
+      }
+    }
+    actx.textAlign = 'start'; actx.textBaseline = 'alphabetic';
   }
 
   // ---------- Mapa cenital ----------
@@ -583,6 +778,10 @@ class Course {
   $('btnMap').addEventListener('click', () => {
     mapMode = mapMode === 'start' ? 'head' : 'start';
     $('btnMap').textContent = mapMode === 'start' ? 'Mapa: inicio ↑' : 'Mapa: rumbo ↑';
+  });
+  $('btnView').addEventListener('click', () => {
+    const ar = app.classList.toggle('arview');
+    $('btnView').textContent = ar ? 'Vista: AR' : 'Vista: mapa';
   });
   $('btnExit').addEventListener('click', () => { if (mode === 'xr' && xr) xr.session.end(); else endAll(); });
 
