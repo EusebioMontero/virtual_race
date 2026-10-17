@@ -57,15 +57,17 @@
   .chip small { display:block; font-size:.6rem; letter-spacing:.05em; text-transform:uppercase; color:#b6c3cf; }
   .chip b { display:block; font-size:1.2rem; font-variant-numeric:tabular-nums; line-height:1.25; }
   .chip em { display:block; font-style:normal; font-size:.62rem; color:#b6c3cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #game { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 80px); left:10px; right:10px; display:none; background:rgba(10,14,18,.7); border-radius:12px; padding:6px 10px; text-align:center; font-size:.92rem; font-weight:600; font-variant-numeric:tabular-nums; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); }
+  /* Franja y aviso apilados bajo los contadores: si uno ocupa dos líneas, el otro baja y no se pisan */
+  #topstack { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 72px); left:10px; right:10px; display:flex; flex-direction:column; gap:6px; pointer-events:none; }
+  #game { display:none; background:rgba(10,14,18,.7); border-radius:12px; padding:6px 10px; text-align:center; font-size:.92rem; font-weight:600; font-variant-numeric:tabular-nums; backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); }
   #game.done, #game.ready { background:rgba(61,220,151,.92); color:#06281a; }
-  #track { position:absolute; top:calc(max(10px, env(safe-area-inset-top)) + 122px); left:50%; transform:translateX(-50%); background:rgba(255,180,84,.94); color:#2b1a00; font-weight:600; font-size:.8rem; padding:4px 12px; border-radius:20px; display:none; white-space:nowrap; }
+  #track { align-self:center; max-width:100%; text-align:center; background:rgba(255,180,84,.94); color:#2b1a00; font-weight:600; font-size:.8rem; padding:4px 12px; border-radius:14px; display:none; }
 
   #panel { position:absolute; left:0; right:0; bottom:0; height:44%; background:rgba(10,14,18,.84); display:flex; flex-direction:column; padding:8px 10px max(10px, env(safe-area-inset-bottom)); gap:8px; }
   #mapwrap { flex:1; min-height:0; border-radius:12px; overflow:hidden; background:#0b1015; }
   #map { width:100%; height:100%; display:block; }
   #btns { display:flex; flex-wrap:wrap; gap:8px; }
-  #btns button { padding:12px 8px; font-size:.92rem; background:#2a3541; flex:1 1 28%; }
+  #btns button { padding:12px 6px; font-size:.92rem; background:#2a3541; flex:1 1 28%; }
   #btnStart { flex:1.5 1 40%; background:var(--accent) !important; color:#06281a; }
   #btnScan { display:none; flex:1 1 40%; background:#2d4a63 !important; }
   #app.xr #btnScan { display:block; }
@@ -79,11 +81,10 @@
   @media (orientation:landscape) {
     #panel { left:auto; width:46%; height:100%; }
     #hud { right:46%; }
-    #game { right:46%; }
-    #track { left:27%; }
+    #topstack { right:46%; }
     #simctl { bottom:10px; }
     #app.arview #panel { left:0; right:0; width:auto; height:auto; }
-    #app.arview #hud, #app.arview #game { right:10px; }
+    #app.arview #hud, #app.arview #topstack { right:10px; }
     #app.xr:not(.arview) #floorinfo { bottom:10px; left:10px; }
   }
 </style>
@@ -127,8 +128,10 @@
     <div class="chip"><small>Recorrido</small><b id="vDist">—</b><em id="sDist">&nbsp;</em></div>
     <div class="chip"><small>En línea recta</small><b id="vStraight">—</b><em id="sStraight">&nbsp;</em></div>
   </div>
-  <div id="game"></div>
-  <div id="track"></div>
+  <div id="topstack">
+    <div id="game"></div>
+    <div id="track"></div>
+  </div>
   <div id="simctl">
     <button id="kLeft" aria-label="Girar a la izquierda">◀</button>
     <button id="kUp" aria-label="Avanzar">▲</button>
@@ -137,7 +140,7 @@
   <div id="panel">
     <div id="mapwrap"><canvas id="map"></canvas></div>
     <div id="btns">
-      <button id="btnScan">Escanear entorno</button>
+      <button id="btnScan">Escanear</button>
       <button id="btnStart">Marcar inicio</button>
       <button id="btnMap">Mapa: inicio ↑</button>
       <button id="btnView">Vista: AR</button>
@@ -499,6 +502,7 @@ class Course {
     scan.state = 'idle'; scan.grid = null; noteUntil = 0;
     mapMode = 'start'; $('btnMap').textContent = 'Mapa: inicio ↑';
     app.className = m + (m === 'xr' ? ' arview' : ''); app.style.display = 'block';   // en AR se empieza en vista AR
+    fitPanel();
     $('btnView').textContent = 'Vista: AR';
     if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wakeLock = l; }).catch(() => {});
   }
@@ -642,7 +646,7 @@ class Course {
     const tr = $('track'), msg = banner || (now < noteUntil ? noteMsg : '');
     if (msg) { tr.textContent = msg; tr.style.display = 'block'; } else tr.style.display = 'none';
     if (mode === 'xr') {
-      const sl = scan.state === 'scanning' ? 'Terminar escaneo' : (scan.state === 'done' || scan.state === 'poor' ? 'Reescanear' : 'Escanear entorno');
+      const sl = scan.state === 'scanning' ? 'Terminar' : (scan.state === 'done' || scan.state === 'poor' ? 'Reescanear' : 'Escanear');
       if (sl !== lastScanLabel) { $('btnScan').textContent = sl; lastScanLabel = sl; }
     }
     const label = odo.started ? 'Reiniciar inicio' : (odo.pending ? 'Esperando…' : 'Marcar inicio');
@@ -754,7 +758,7 @@ class Course {
     g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
-      + (inR ? '¡al alcance! Pulsa el punto' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+      + (inR ? '¡Pulsa el punto!' : turn) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
   }
 
   // ---------- Capturar un punto: a menos de 0,5 m y pulsando una parte del punto ----------
@@ -1063,8 +1067,10 @@ class Course {
     ctx.fillText('cuadrícula: ' + step + ' m', 8, h - 8);
     ctx.fillText(mapMode === 'head' && started ? '▲ rumbo actual' : '▲ rumbo del inicio', 8, 16);
     if (!started) {
-      ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.font = '600 14px system-ui,sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText(odo.pending ? 'Esperando tracking…' : 'Pulsa «Marcar inicio»', w / 2, h / 2);
+      ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.textAlign = 'center';
+      const small = w < 260, lines = odo.pending ? ['Esperando tracking…'] : (small ? ['Pulsa', '«Marcar inicio»'] : ['Pulsa «Marcar inicio»']);
+      ctx.font = '600 ' + (small ? 12 : 14) + 'px system-ui,sans-serif';
+      lines.forEach((t, i) => ctx.fillText(t, w / 2, h * 0.3 + i * (small ? 15 : 18)));   // por encima de la flecha del robot, que está en el centro
     }
   }
 
@@ -1083,6 +1089,15 @@ class Course {
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
+
+  // ---------- Disposición: minimapa y chip del suelo siempre justo encima de los botones ----------
+  // La barra de botones cambia de alto (etiquetas largas, 1–2 filas, orientación), así que se mide en vez de suponerlo
+  function fitPanel() {
+    const hgt = $('btns').offsetHeight;
+    if (hgt && app.style.setProperty) app.style.setProperty('--btnsH', (hgt + 8) + 'px');
+  }
+  if (typeof ResizeObserver === 'function') new ResizeObserver(fitPanel).observe($('btns'));
+  addEventListener('resize', fitPanel);
 
   // ---------- Controles ----------
   app.addEventListener('beforexrselect', e => e.preventDefault());   // los toques en la interfaz no son "select" de XR
@@ -1109,6 +1124,7 @@ class Course {
   $('btnView').addEventListener('click', () => {
     const ar = app.classList.toggle('arview');
     $('btnView').textContent = ar ? 'Vista: AR' : 'Vista: mapa';
+    fitPanel();
   });
   $('btnScan').addEventListener('click', () => { if (scan.state === 'scanning') finishScan(); else startScan(); });
   $('btnExit').addEventListener('click', () => { if (mode === 'xr' && xr) xr.session.end(); else endAll(); });
