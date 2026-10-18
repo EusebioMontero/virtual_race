@@ -99,7 +99,7 @@
 
   <button id="btnXR" class="mode main" disabled>
     <b>AR completo (ARCore)</b>
-    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos pequeños que se mueven: acércate a menos de 1 m, apunta con el punto de mira (centro de la pantalla) y toca el globo, o toca en cualquier sitio con la mira sobre él. Solo tienes 10 disparos para los 5 globos: cada toque a menos de 1 m gasta uno, aciertes o no. Solo Chrome en Android.</span>
+    <span>Giro y metros reales con la cámara del móvil. Puedes escanear el entorno con un barrido de unos segundos (usa la profundidad de ARCore) y los 5 puntos saldrán en sitios libres, sobre la cámara, para recorrerlos andando: los puntos son globos pequeños que se mueven: acércate a menos de 1 m y mantén el globo 3 s en el punto de mira (centro de la pantalla); entonces toca la pantalla para disparar el láser (el rayo dura 0,5 s). Solo tienes 10 disparos para los 5 globos: cada disparo gasta uno, aciertes o no. Solo Chrome en Android.</span>
   </button>
   <button id="btnGyro" class="mode" disabled>
     <b>Cámara + giroscopio</b>
@@ -407,14 +407,15 @@ function pointInEllipse(px, py, e, slack = 0) {
   return ((px - e.x) / a) ** 2 + ((py - e.y) / b) ** 2 <= 1;
 }
 
-// Disparo láser: un rayo que sale de abajo de la pantalla hacia el punto tocado. Tiempos en ms: la cabeza del rayo avanza en
-// `hit`/`miss` ms y la cola empieza a seguirla pasados `delay` ms (así se ve un destello que viaja y desaparece).
-const LASER_T = { hit: 110, miss: 300, delay: 90 };
-// Tramo visible del rayo (distancias sobre su longitud total `len`) a los `age` ms del disparo; null cuando ya ha desaparecido
+// Disparo láser: un rayo que sale de abajo de la pantalla. Dura LASER_MS (0,5 s): la punta tarda LASER_EXT ms en llegar al final
+// (el globo si acierta, el borde de la pantalla si falla), el rayo se mantiene y se apaga en los últimos 150 ms.
+const LASER_MS = 500;
+const LASER_EXT = { hit: 100, miss: 180 };
+// Tramo visible del rayo (distancias sobre su longitud total `len`) a los `age` ms del disparo, y su opacidad; null cuando ya se ha apagado
 function laserSpan(len, age, hit) {
-  const th = hit ? LASER_T.hit : LASER_T.miss;
-  const head = Math.min(1, Math.max(0, age / th)), tail = Math.min(1, Math.max(0, (age - LASER_T.delay) / th));
-  return tail >= 1 ? null : { a: tail * len, b: head * len };
+  if (age >= LASER_MS) return null;
+  const head = Math.min(1, Math.max(0, age / (hit ? LASER_EXT.hit : LASER_EXT.miss)));
+  return { a: 0, b: head * len, fade: age < LASER_MS - 150 ? 1 : (LASER_MS - age) / 150 };
 }
 // Distancia s > 0 a la que el rayo o + s·u (u unitario) sale del rectángulo [-m, W+m] × [-m, H+m] (o está dentro)
 function rayExit(o, u, W, H, m = 20) {
@@ -422,6 +423,30 @@ function rayExit(o, u, W, H, m = 20) {
   if (u.x > 1e-9) s = Math.min(s, (W + m - o.x) / u.x); else if (u.x < -1e-9) s = Math.min(s, (-m - o.x) / u.x);
   if (u.y > 1e-9) s = Math.min(s, (H + m - o.y) / u.y); else if (u.y < -1e-9) s = Math.min(s, (-m - o.y) / u.y);
   return s;
+}
+
+/*
+ * Apuntado: para poder disparar hay que mantener el globo en la mira (y a su alcance) `hold` ms seguidos. Si se escapa más de
+ * `grace` ms se empieza de cero (mientras está fuera, dentro de esa tolerancia, el reloj se para). Al completarse queda "armado"
+ * hasta que se pierde el blanco o se dispara.
+ */
+const AIM_HOLD = 3000, AIM_GRACE = 250;
+class AimLock {
+  constructor(hold = AIM_HOLD, grace = AIM_GRACE) { this.hold = hold; this.grace = grace; this.reset(); }
+  reset() { this.t0 = null; this.lost = null; this.armed = false; }
+  held(now) { return this.t0 == null ? 0 : Math.max(0, Math.min(now, this.lost ?? now) - this.t0); }
+  progress(now) { return Math.min(1, this.held(now) / this.hold); }
+  // `on`: ¿está ahora el globo en la mira y a su alcance?
+  update(now, on) {
+    if (on) {
+      if (this.t0 == null) this.t0 = now;
+      else if (this.lost != null) { this.t0 += now - this.lost; this.lost = null; }
+    } else if (this.t0 != null) {
+      if (this.lost == null) this.lost = now;
+      else if (now - this.lost > this.grace) { this.reset(); return; }
+    }
+    if (!this.armed && this.held(now) >= this.hold) this.armed = true;
+  }
 }
 
 /*
@@ -505,7 +530,7 @@ class Course {
   // Escaneo del entorno: 'idle' | 'scanning' | 'done' | 'poor' (poco espacio libre)
   const scan = { state: 'idle', grid: null, t0: 0, frames: 0, noDepth: 0 };
   let noteMsg = '', noteUntil = 0;   // aviso temporal en el banner
-  let hitAR = null, hitMap = null; let lasers = [];   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
+  let hitAR = null, hitMap = null; let lasers = []; const aim = new AimLock();   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
   let wasInRange = false;            // para vibrar una vez al entrar en el radio del punto
   let flash = null;                  // onda verde al capturar un punto: { w, t, R }
   let pops = [];                     // globos explotando: { x, y, z, rgb, t, frags }
@@ -622,6 +647,14 @@ class Course {
   }
 
   // ---------- Fuentes de pose ----------
+  // Apuntado: el tiempo corre mientras el globo actual está bajo la mira (centro) y a su alcance
+  function updateAim(now) {
+    const W = arC.clientWidth, H = arC.clientHeight, ball = hitAR && hitAR.ball;
+    const was = aim.armed;
+    aim.update(now, !!course && !course.done && odo.started && !!ball && course.inRange(odo.s.cur) && pointInEllipse(W / 2, H / 2, ball, 4));
+    if (!was && aim.armed && navigator.vibrate) navigator.vibrate(40);   // aviso táctil: ya se puede disparar
+  }
+
   function onXRFrame(t, frame) {
     if (!xr) return;
     xr.session.requestAnimationFrame(onXRFrame);
@@ -633,7 +666,7 @@ class Course {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     const pose = frame.getViewerPose(xr.refSpace);
-    if (!pose) { tick(null, 'Sin pose: mueve el móvil despacio'); drawAR(null); return; }
+    if (!pose) { tick(null, 'Sin pose: mueve el móvil despacio'); drawAR(null); updateAim(performance.now()); return; }
     const pos = pose.transform.position, v = xrVectors(pose.transform.orientation);
     lastHeading = headingFromVectors(v.f, v.u, lastHeading);
     const ok = !pose.emulatedPosition;
@@ -642,6 +675,7 @@ class Course {
     camY = pos.y;
     tick({ x: pos.x, z: pos.z, h: lastHeading, ok }, ok ? '' : 'Tracking perdido: mueve el móvil despacio');
     drawAR(pose);
+    updateAim(performance.now());
   }
 
   function onOri(e) {
@@ -770,6 +804,12 @@ class Course {
     return new Course(5, opts);
   }
 
+  // Estado del apuntado para la franja de arriba
+  function aimText(now) {
+    if (aim.armed) return '¡LISTO! Toca para disparar';
+    return aim.held(now) > 0 ? 'Apuntando… ' + ((AIM_HOLD - aim.held(now)) / 1000).toFixed(1) + ' s' : 'Mantén el globo en la mira ' + (AIM_HOLD / 1000) + ' s';
+  }
+
   function updateGame(now) {
     const g = $('game');
     if (scan.state === 'scanning') {
@@ -800,7 +840,7 @@ class Course {
     g.className = inR ? 'ready' : '';
     const turn = Math.abs(gd.turn) < 8 ? '↑ recto' : (gd.turn > 0 ? '↻ ' : '↺ ') + Math.abs(gd.turn).toFixed(0) + '°';
     g.textContent = 'Punto ' + (course.idx + 1) + '/' + course.pts.length + ' · ' + gd.dist.toFixed(1) + ' m · '
-      + (inR ? '¡Apunta con la mira y toca el globo!' : turn) + ' · 🎯 ' + disparos(course.shotsLeft) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
+      + (inR ? (mode === 'xr' ? aimText(now) : '¡Pulsa el punto en el mapa!') : turn) + ' · 🎯 ' + disparos(course.shotsLeft) + ' · ' + course.elapsed(now).toFixed(1) + ' s' + (course.note ? ' · ' + course.note : '');
   }
 
   // ---------- Disparar: a menos de 1 m del punto, solo 10 disparos y hay que acertar el globo ----------
@@ -816,6 +856,7 @@ class Course {
       showNote('Estás a ' + d.toFixed(1) + ' m · acércate a menos de ' + String(course.radius).replace('.', ',') + ' m para disparar');
       return;
     }
+    aim.reset();                                          // tras cada disparo hay que volver a apuntar 3 s
     if (res === 'hit') {
       const bp = balloonPos(w, floorY(), idx, now);
       flash = { w, t: now, R: course.radius };
@@ -842,10 +883,18 @@ class Course {
     lasers.push({ ox: o.x, oy: o.y, ux: dx, uy: dy, len, hit, t: now });
   }
 
-  // Disparo en la vista de cámara: acierta si el toque cae sobre el globo, o si se toca en cualquier sitio con la mira (centro) sobre él
-  function shootAR(tx, ty) {
-    const ball = hitAR && hitAR.ball, W = arC.clientWidth, H = arC.clientHeight;
-    fire(!!ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4)), tx, ty, ball);
+  // Disparo en la vista de cámara (cualquier toque): solo se puede si el globo lleva 3 s en la mira (y a menos de 1 m). El láser
+  // sale hacia la mira (centro): acierta si el globo sigue bajo ella; si se ha escapado justo antes, falla y el rayo sigue de largo.
+  function shootAR() {
+    if (!course || course.done || !odo.started) return;
+    const W = arC.clientWidth, H = arC.clientHeight, ball = hitAR && hitAR.ball, now = performance.now();
+    if (!course.inRange(odo.s.cur)) { fire(false, W / 2, H / 2, ball); return; }     // solo avisa de la distancia: no se dispara
+    if (!aim.armed) {
+      const over = !!ball && pointInEllipse(W / 2, H / 2, ball, 4), left = (AIM_HOLD - aim.held(now)) / 1000;
+      showNote(over ? 'Sigue apuntando: faltan ' + left.toFixed(1) + ' s para poder disparar' : 'Pon el globo en la mira ' + (AIM_HOLD / 1000) + ' s para poder disparar', 1500);
+      return;
+    }
+    fire(!!ball && pointInEllipse(W / 2, H / 2, ball, 4), W / 2, H / 2, ball);
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -1001,7 +1050,7 @@ class Course {
         if (actual) {
           actx.fillStyle = ready ? '#3ddc97' : '#fff'; actx.font = '700 14px system-ui,sans-serif';
           actx.textAlign = 'center'; actx.textBaseline = 'middle';
-          actx.fillText(ready ? '¡TÓCALO!' : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', c.x, c.y - ry - 16);                      // encima del globo: la mira (centro) queda libre
+          actx.fillText(ready ? (pointInEllipse(W / 2, H / 2, { x: c.x, y: c.y, rx, ry }, 4) ? '' : 'ponlo en la mira') : Math.hypot(t.w.x - cam.x, t.w.z - cam.z).toFixed(1) + ' m', c.x, c.y - ry - 16);                      // encima del globo: la mira (centro) queda libre
         }
       } else if (actual) {                                               // fuera de pantalla: aviso en el borde
         const g = course.guide(odo.s.cur, odo.s.rel), right = g.turn > 0;
@@ -1037,7 +1086,7 @@ class Course {
     }
 
     // Rayos láser: cuerpo que se afina con la distancia (perspectiva), brillo rojo y núcleo blanco; destello en la boca
-    lasers = lasers.filter(q => now - q.t < LASER_T.delay + LASER_T.miss);
+    lasers = lasers.filter(q => now - q.t < LASER_MS);
     for (const q of lasers) {
       const age = now - q.t, sp = laserSpan(q.len, age, q.hit);
       if (!sp) continue;
@@ -1049,7 +1098,7 @@ class Course {
         actx.moveTo(ax + nx * wa, ay + ny * wa); actx.lineTo(bx + nx * wb, by + ny * wb);
         actx.lineTo(bx - nx * wb, by - ny * wb); actx.lineTo(ax - nx * wa, ay - ny * wa); actx.closePath(); actx.fill();
       };
-      const fade = Math.max(0, 1 - Math.max(0, age - LASER_T.delay) / (q.hit ? LASER_T.hit : LASER_T.miss) * 0.4);
+      const fade = sp.fade;
       poly(10, 'rgba(255,40,70,' + 0.28 * fade + ')');
       poly(4.5, 'rgba(255,60,80,' + 0.85 * fade + ')');
       poly(1.8, 'rgba(255,255,255,' + fade + ')');
@@ -1060,15 +1109,25 @@ class Course {
       }
     }
 
-    // Punto de mira en el centro: se vuelve verde cuando está sobre el globo y se puede explotar, ámbar si está sobre él pero lejos
+    // Punto de mira en el centro: ámbar con el globo encima (se carga un anillo durante 3 s), verde cuando ya se puede disparar
     if (!course.done) {
       const ball = hitAR && hitAR.ball, over = !!ball && pointInEllipse(W / 2, H / 2, ball, 4);
-      const col = over ? (listo ? '#3ddc97' : '#ffb454') : 'rgba(255,255,255,.9)', cx = W / 2, cy = H / 2, r = over ? 24 : 20;
+      const armed = aim.armed, prog = aim.progress(now);
+      const col = armed ? '#3ddc97' : over ? '#ffb454' : 'rgba(255,255,255,.9)', cx = W / 2, cy = H / 2, r = over ? 24 : 20;
       actx.strokeStyle = 'rgba(0,0,0,.45)'; actx.lineWidth = 5; actx.beginPath(); actx.arc(cx, cy, r, 0, 7); actx.stroke();
       actx.strokeStyle = col; actx.lineWidth = 2.5; actx.beginPath(); actx.arc(cx, cy, r, 0, 7);
       for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { actx.moveTo(cx + dx * (r - 6), cy + dy * (r - 6)); actx.lineTo(cx + dx * (r + 9), cy + dy * (r + 9)); }
       actx.stroke();
       actx.fillStyle = col; actx.beginPath(); actx.arc(cx, cy, 2.5, 0, 7); actx.fill();
+      if (listo && (armed || prog > 0)) {                                                   // anillo de carga: se llena en 3 s
+        const rr = r + 13;
+        actx.strokeStyle = 'rgba(0,0,0,.45)'; actx.lineWidth = 8; actx.beginPath(); actx.arc(cx, cy, rr, 0, 7); actx.stroke();
+        actx.strokeStyle = armed ? '#3ddc97' : '#ffb454'; actx.lineWidth = armed ? 6 + 2 * Math.sin(now / 90) : 5; actx.beginPath();
+        actx.arc(cx, cy, rr, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * prog); actx.stroke();
+        actx.font = '800 15px system-ui,sans-serif'; actx.textAlign = 'center'; actx.textBaseline = 'middle';
+        actx.lineWidth = 4; actx.strokeStyle = 'rgba(0,0,0,.55)'; const lb = armed ? '¡DISPARA!' : ((AIM_HOLD - aim.held(now)) / 1000).toFixed(1) + ' s';
+        actx.strokeText(lb, cx, cy + rr + 22); actx.fillStyle = armed ? '#3ddc97' : '#ffb454'; actx.fillText(lb, cx, cy + rr + 22);
+      }
     }
     // Toques que han fallado: una X roja que se desvanece
     misses = misses.filter(q => now - q.t < 500);
@@ -1234,14 +1293,14 @@ class Course {
 
   // ---------- Controles ----------
   app.addEventListener('beforexrselect', e => e.preventDefault());   // los toques en la interfaz no son "select" de XR
-  // Disparar: en la cámara, un toque sobre el globo (o en cualquier sitio con la mira sobre él); en el mapa, el círculo del punto
+  // Disparar: en la cámara, un toque en cualquier sitio (si el globo lleva 3 s en la mira); en el mapa, el círculo del punto
   app.addEventListener('pointerdown', e => {
     if (!course || course.done || !odo.started) return;
     if (e.target && e.target.closest && e.target.closest('button')) return;
-    const mb = mapC.getBoundingClientRect(), ab = arC.getBoundingClientRect();
+    const mb = mapC.getBoundingClientRect();
     const inMap = e.clientX >= mb.left && e.clientX <= mb.right && e.clientY >= mb.top && e.clientY <= mb.bottom;
-    if (inMap) { if (hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r) fire(true); }
-    else if (mode === 'xr') shootAR(e.clientX - ab.left, e.clientY - ab.top);
+    if (mode === 'xr' && /\barview\b/.test(app.className)) shootAR();     // vista de cámara: el minimapa no sirve para disparar
+    else if (inMap && hitMap && Math.hypot(e.clientX - mb.left - hitMap.x, e.clientY - mb.top - hitMap.y) <= hitMap.r) fire(true);
   });
   $('btnXR').addEventListener('click', startXR);
   $('btnGyro').addEventListener('click', startGyro);
@@ -1271,7 +1330,7 @@ class Course {
   addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
   addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
 
-  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, balloonPos, get course() { return course; }, floor, get pops() { return pops; }, get misses() { return misses; }, get lasers() { return lasers; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
+  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, aim, balloonPos, get course() { return course; }, floor, get pops() { return pops; }, get misses() { return misses; }, get lasers() { return lasers; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
   checkSupport();
 })();
 </script>
