@@ -407,6 +407,23 @@ function pointInEllipse(px, py, e, slack = 0) {
   return ((px - e.x) / a) ** 2 + ((py - e.y) / b) ** 2 <= 1;
 }
 
+// Disparo láser: un rayo que sale de abajo de la pantalla hacia el punto tocado. Tiempos en ms: la cabeza del rayo avanza en
+// `hit`/`miss` ms y la cola empieza a seguirla pasados `delay` ms (así se ve un destello que viaja y desaparece).
+const LASER_T = { hit: 110, miss: 300, delay: 90 };
+// Tramo visible del rayo (distancias sobre su longitud total `len`) a los `age` ms del disparo; null cuando ya ha desaparecido
+function laserSpan(len, age, hit) {
+  const th = hit ? LASER_T.hit : LASER_T.miss;
+  const head = Math.min(1, Math.max(0, age / th)), tail = Math.min(1, Math.max(0, (age - LASER_T.delay) / th));
+  return tail >= 1 ? null : { a: tail * len, b: head * len };
+}
+// Distancia s > 0 a la que el rayo o + s·u (u unitario) sale del rectángulo [-m, W+m] × [-m, H+m] (o está dentro)
+function rayExit(o, u, W, H, m = 20) {
+  let s = Infinity;
+  if (u.x > 1e-9) s = Math.min(s, (W + m - o.x) / u.x); else if (u.x < -1e-9) s = Math.min(s, (-m - o.x) / u.x);
+  if (u.y > 1e-9) s = Math.min(s, (H + m - o.y) / u.y); else if (u.y < -1e-9) s = Math.min(s, (-m - o.y) / u.y);
+  return s;
+}
+
 /*
  * Carrera de puntos: n puntos aleatorios en coordenadas del mapa (r = derecha, f = adelante
  * respecto al inicio), encadenados a max(1,5; 2·radius)–(+1,5) m unos de otros (sin solapar sus radios) y dentro de un cuadrado de ±limit m.
@@ -488,7 +505,7 @@ class Course {
   // Escaneo del entorno: 'idle' | 'scanning' | 'done' | 'poor' (poco espacio libre)
   const scan = { state: 'idle', grid: null, t0: 0, frames: 0, noDepth: 0 };
   let noteMsg = '', noteUntil = 0;   // aviso temporal en el banner
-  let hitAR = null, hitMap = null;   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
+  let hitAR = null, hitMap = null; let lasers = [];   // zonas pulsables del punto actual (en píxeles), recalculadas en cada dibujo
   let wasInRange = false;            // para vibrar una vez al entrar en el radio del punto
   let flash = null;                  // onda verde al capturar un punto: { w, t, R }
   let pops = [];                     // globos explotando: { x, y, z, rgb, t, frags }
@@ -790,7 +807,7 @@ class Course {
   const disparos = n => n + (n === 1 ? ' disparo' : ' disparos');
   // Un disparo (`hit`: ¿ha dado en el globo?; (tx, ty): dónde se tocó, para marcar el fallo).
   // Lejos del punto (> 1 m) no se dispara ni se gasta munición; a su alcance cada disparo gasta uno, acierte o falle.
-  function fire(hit, tx, ty) {
+  function fire(hit, tx, ty, ball) {
     if (!course || course.done || !odo.started) return;
     const now = performance.now(), cur = odo.s.cur, t = course.target, idx = course.idx, w = odo.mapToWorld(t.r, t.f);
     const res = course.shoot(cur, now, hit);
@@ -809,16 +826,26 @@ class Course {
       }
       pops.push({ x: bp.x, y: bp.y, z: bp.z, rgb: BALLOON_RGB[idx % 5], t: now, frags });
     } else misses.push({ x: tx ?? arC.clientWidth / 2, y: ty ?? arC.clientHeight / 2, t: now });
+    if (tx != null && mode === 'xr') shootLaser(hit && ball ? ball.x : tx, hit && ball ? ball.y : ty, hit, now);
     if (navigator.vibrate) navigator.vibrate(course.failed ? [80, 40, 80, 40, 80] : course.done ? [60, 40, 60] : res === 'hit' ? 60 : 15);
     if (course.failed) showNote('¡Sin disparos! Globos explotados: ' + course.idx + '/' + course.pts.length, 5000);
     else if (!course.done) showNote(res === 'hit' ? '¡Pop! Globo ' + (idx + 1) + ' ✓ · quedan ' + disparos(course.shotsLeft)
                                                   : '¡Fallaste! Quedan ' + disparos(course.shotsLeft) + ' · pon la mira sobre el globo y toca', 1500);
   }
 
+  // Láser: sale del borde inferior de la pantalla hacia (tx, ty). Si da en el globo termina en él; si falla, NO se detiene en el
+  // punto tocado: sigue su camino hasta salir de la pantalla.
+  function shootLaser(tx, ty, hit, now) {
+    const W = arC.clientWidth, H = arC.clientHeight, o = { x: W / 2, y: H + 30 };
+    let dx = tx - o.x, dy = ty - o.y; const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+    const len = hit ? d : Math.max(d, rayExit(o, { x: dx, y: dy }, W, H));
+    lasers.push({ ox: o.x, oy: o.y, ux: dx, uy: dy, len, hit, t: now });
+  }
+
   // Disparo en la vista de cámara: acierta si el toque cae sobre el globo, o si se toca en cualquier sitio con la mira (centro) sobre él
   function shootAR(tx, ty) {
     const ball = hitAR && hitAR.ball, W = arC.clientWidth, H = arC.clientHeight;
-    fire(!!ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4)), tx, ty);
+    fire(!!ball && (pointInEllipse(tx, ty, ball, 10) || pointInEllipse(W / 2, H / 2, ball, 4)), tx, ty, ball);
   }
 
   // ---------- Realidad aumentada: suelo y puntos sobre la cámara ----------
@@ -1006,6 +1033,30 @@ class Course {
         actx.fillStyle = 'rgba(255,255,255,' + (1 - k) + ')'; actx.strokeStyle = 'rgba(0,0,0,' + 0.4 * (1 - k) + ')'; actx.lineWidth = 4;
         actx.font = '800 ' + Math.round(26 + 14 * k) + 'px system-ui,sans-serif'; actx.textAlign = 'center'; actx.textBaseline = 'middle';
         actx.strokeText('¡POP!', c0.x, c0.y - age * 70); actx.fillText('¡POP!', c0.x, c0.y - age * 70);
+      }
+    }
+
+    // Rayos láser: cuerpo que se afina con la distancia (perspectiva), brillo rojo y núcleo blanco; destello en la boca
+    lasers = lasers.filter(q => now - q.t < LASER_T.delay + LASER_T.miss);
+    for (const q of lasers) {
+      const age = now - q.t, sp = laserSpan(q.len, age, q.hit);
+      if (!sp) continue;
+      const half = s => 1 - 0.8 * s / q.len;                                          // 1 en la boca, 0,2 al final
+      const poly = (w, style) => {
+        const nx = -q.uy, ny = q.ux, wa = w * half(sp.a), wb = w * half(sp.b);
+        const ax = q.ox + q.ux * sp.a, ay = q.oy + q.uy * sp.a, bx = q.ox + q.ux * sp.b, by = q.oy + q.uy * sp.b;
+        actx.fillStyle = style; actx.beginPath();
+        actx.moveTo(ax + nx * wa, ay + ny * wa); actx.lineTo(bx + nx * wb, by + ny * wb);
+        actx.lineTo(bx - nx * wb, by - ny * wb); actx.lineTo(ax - nx * wa, ay - ny * wa); actx.closePath(); actx.fill();
+      };
+      const fade = Math.max(0, 1 - Math.max(0, age - LASER_T.delay) / (q.hit ? LASER_T.hit : LASER_T.miss) * 0.4);
+      poly(10, 'rgba(255,40,70,' + 0.28 * fade + ')');
+      poly(4.5, 'rgba(255,60,80,' + 0.85 * fade + ')');
+      poly(1.8, 'rgba(255,255,255,' + fade + ')');
+      const hx = q.ox + q.ux * sp.b, hy = q.oy + q.uy * sp.b;                          // cabeza brillante
+      actx.fillStyle = 'rgba(255,255,255,' + fade + ')'; actx.beginPath(); actx.arc(hx, hy, 4.5 * half(sp.b) + 1.5, 0, 7); actx.fill();
+      if (age < 200) {                                                                // destello en la boca
+        actx.fillStyle = 'rgba(255,70,90,' + 0.5 * (1 - age / 200) + ')'; actx.beginPath(); actx.arc(W / 2, H, 46 * (1 - age / 400), 0, 7); actx.fill();
       }
     }
 
@@ -1220,7 +1271,7 @@ class Course {
   addEventListener('keydown', e => { if (mode === 'sim' && keys[e.key]) { sim[keys[e.key]] = true; e.preventDefault(); } });
   addEventListener('keyup', e => { if (keys[e.key]) sim[keys[e.key]] = false; });
 
-  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, balloonPos, get course() { return course; }, floor, get pops() { return pops; }, get misses() { return misses; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
+  if (window.__VR_DEBUG) window.__VR_DEBUG({ odo, scan, balloonPos, get course() { return course; }, floor, get pops() { return pops; }, get misses() { return misses; }, get lasers() { return lasers; }, get hitAR() { return hitAR; }, get hitMap() { return hitMap; } });   // gancho para las pruebas
   checkSupport();
 })();
 </script>
